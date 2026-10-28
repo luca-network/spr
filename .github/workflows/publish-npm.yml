@@ -19,6 +19,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with: { node-version: 24, registry-url: "https://registry.npmjs.org", package-manager-cache: false }
+      # Trusted publishing needs npm 11.5.1 or later; the one that comes with Node may be older.
+      - name: Up-to-date npm
+        run: npm install -g npm@latest && node --version && npm --version
       - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: pip install "cryptography>=42"
