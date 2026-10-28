@@ -14,19 +14,26 @@ export interface IntentInput {
   rail?: string; rail_ref?: Record<string, string>; terms?: Record<string, unknown>; expires_in?: string; expires_in_hours?: number;
 }
 export interface IntentReceipt {
-  intent_id: string; decision: string; checks: Check[]; declared_at: string; expires_at: string; max_amount_minor: number | null;
+  intent_id: string; decision: "none" | "within_mandate" | "outside_mandate"; authority: Authority; checks: Check[]; declared_at: string; expires_at: string; max_amount_minor: number | null;
   seal: Seal; binding: { scheme: string; nonce: string } | null;
 }
+/** "self-declared": the book's own mandate.json, written by whoever keeps the book. "none": no mandate.json. */
+export type Authority = "self-declared" | "none";
 export interface SettlementInput {
+  /** ISO 8601 with its offset (Z or ±hh:mm); a time without one is refused. Omitted: the time of sealing, and the record says so. */
   rail: string; source_id: string; amount_minor: number; currency: string; occurred_at?: string; counterparty?: string;
+  /** Only to correct a payment already sealed with different facts: the new version carries the reason. */
+  correction?: { reason: string };
   intent_id?: string; memo?: string; state?: "cleared" | "pending"; direction?: "outflow" | "inflow"; nonce?: string | null;
   x402?: { authorization?: { nonce?: string } }; evidence?: Record<string, unknown>;
 }
+/** "conflict": different facts for a payment already sealed, given without a correction. Nothing is sealed, and
+ *  differs lists what differs. */
 export interface SealResult {
-  status: "recorded" | "new_version" | "unchanged"; record_id: string; within_consent?: boolean | null; binding?: string | null;
-  checks?: Check[]; seal: Seal;
+  status: "recorded" | "new_version" | "unchanged" | "conflict"; record_id: string; within_consent?: boolean | null; binding?: string | null;
+  checks?: Check[]; seal?: Seal; sealed?: false; differs?: { field: string; sealed: unknown; given: unknown }[]; how?: string;
 }
-export interface PaymentCheck { id: string; decision: "approve" | "decline"; checks: Check[]; reasons: string[]; seal: Seal }
+export interface PaymentCheck { id: string; decision: "approve" | "decline"; authority: Authority; checks: Check[]; reasons: string[]; seal: Seal }
 export interface Label { label_id: string; record_id: string; shared: any; shared_sha256: string; sign_this: string; signatures: any[]; state?: string }
 export declare class SprBook {
   constructor(cfg: BookConfig);
@@ -45,6 +52,21 @@ export declare class SprBook {
   verifyRecord(recordId: string): SealCheck & { record_id: string; core_fields: CoreCheck; key_id: string; how_to_check: string };
   listRecords(opts?: { all?: boolean }): { record_id: string; rail: string; amount_minor: number; currency: string; settled_on: string; counterparty: string | null; intent_id: string | null; within_consent: boolean | null; payload_sha256: string }[];
   exportPackage(outDir: string): { folder: string; files: string[]; verified: boolean; passed: number; failed: number };
+  /** The book's public key, which finance registers with Luca once. */
+  publicKey(): { key_id: string; public_pem: string; entity: string; agent_id: string };
+  /** The book as a package: each file by name, as text, with a sealed manifest. */
+  packageFiles(): Record<string, string>;
+  /** Sends the book to Luca, which checks every seal before storing anything. url and apiKey default to LUCA_URL and LUCA_API_KEY. */
+  sendToLuca(opts?: LucaOptions): Promise<LucaImport>;
+  /** Asks Luca to accept this book's key for an entity; needs a finance user's key and a second person's approval. */
+  registerWithLuca(opts: LucaOptions & { entityId: string; agentOnly?: boolean }): Promise<{ change: { id: string; status: string } }>;
+}
+export interface LucaOptions { url?: string; apiKey?: string; fetch?: typeof fetch }
+export interface LucaImport {
+  import_id: string; package_sha256: string; entity_id: string; checks: { passed: number; failed: number };
+  records_in_package: number; current_records: number; created: number; versioned: number; unchanged: number; read_from_rail: number; differs_from_rail: number;
+  items: { spr_record_id: string; spr_payload_sha256: string; record_id: string | null; outcome: "created" | "versioned" | "unchanged" | "read_from_rail";
+    differs: { field: string; rail: unknown; spr: unknown }[] | null }[];
 }
 export interface SprTool { name: string; description: string; parameters: Record<string, any>; run(args: any): unknown }
 export declare function sprTools(book: SprBook): SprTool[];

@@ -8,19 +8,23 @@ import { sprTools, SDK_PRODUCER } from "@luca-network/spr-sdk";
 const obj = (properties, required = []) => ({ type: "object", properties, required });
 
 // The SDK's tools, and two that only make sense on a long-running server: listing the book and exporting it.
-export function mcpTools(book) {
+// With Luca's address and an API key (opts.luca, or LUCA_URL and LUCA_API_KEY for the command), a third sends the
+// book to Luca's hosted service.
+export function mcpTools(book, opts = {}) {
   return [
     ...sprTools(book),
     { name: "list_records", description: "The current version of each payment in your company's book (all versions with all: true).",
       parameters: obj({ all: { type: "boolean" } }), run: (a) => book.listRecords({ all: a?.all }), readOnly: true },
     { name: "export_package", description: "Copy the book to a folder with a sealed manifest, for an auditor, a counterparty or Luca. Anyone checks it with spr-verify.",
       parameters: obj({ folder: { type: "string", description: "Where to write the package" } }, ["folder"]), run: (a) => book.exportPackage(a.folder) },
+    ...(opts.luca ? [{ name: "send_to_luca", description: "Send the book to Luca, which checks every seal, then classifies each payment and posts it to the company's books. Sending it again changes nothing.",
+      parameters: obj({}), run: () => book.sendToLuca(opts.luca) }] : []),
   ];
 }
 const READ_ONLY = new Set(["get_intent", "verify_record", "list_records"]);
 
 export function createSprMcpServer(book, opts = {}) {
-  const tools = mcpTools(book);
+  const tools = mcpTools(book, opts);
   const server = new Server({ name: opts.name ?? "spr", version: opts.version ?? SDK_PRODUCER.version }, {
     capabilities: { tools: {} },
     instructions: "SPR keeps the accounting record of what you pay for, sealed with your company's own key in your company's own folder. " +

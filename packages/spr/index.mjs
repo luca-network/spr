@@ -241,11 +241,17 @@ export function checkIntent(p) {
 
 // ---- 9. a local package ----------------------------------------------------------------------------------
 // A folder (or a map of file name to bytes) holding keys.jsonl, intents.jsonl, records.jsonl and a sealed
-// manifest.json, as the MCP server's local mode writes it. Returns every check made, and ok when all pass.
+// manifest.json, as the SDKs export it. Returns every check made, and ok when all pass.
+// A book's own folder holds its private key (key.pem) and no manifest: it is checked as a book, every seal and
+// core field, and the answer says to export it before sharing. A package that holds a private key fails.
 export function verifyPackage(read) {
   const results = [];
   const check = (what, ok, detail = "") => { results.push({ what, ok: Boolean(ok), detail }); return ok; };
   const jsonl = (name) => { const b = read(name); return b ? b.toString("utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l)) : []; };
+  const holdsKey = Boolean(read("key.pem"));
+  const kind = holdsKey && !read("manifest.json") ? "book" : "package";
+  if (kind === "book") check("this is a book's own folder: its seals and fields are checked below; it holds the private key, so share an export of it instead", true);
+  else if (holdsKey) check("the package holds no private key", false, "key.pem is a private key and must never be shared");
   const keys = new Map(jsonl("keys.jsonl").map((k) => [k.key_id, k]));
   const sealOk = (payload, seal) => {
     const s = normalizeSeal(seal ?? {});
@@ -255,7 +261,7 @@ export function verifyPackage(read) {
     return { ok: v.ok, detail: v.ok ? "" : !v.hash_matches ? "the payload's hash is not the sealed hash" : "the signature does not verify with that key" };
   };
   const manifestBytes = read("manifest.json");
-  if (check("manifest.json is present", Boolean(manifestBytes))) {
+  if (kind === "package" && check("manifest.json is present", Boolean(manifestBytes))) {
     const m = JSON.parse(manifestBytes.toString("utf8"));
     const s = sealOk(m.package, m.seal);
     check("the manifest is sealed", s.ok, s.detail);
@@ -292,5 +298,5 @@ export function verifyPackage(read) {
       }
     }
   }
-  return { ok: results.every((r) => r.ok), passed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
+  return { kind, ok: results.every((r) => r.ok), passed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
 }

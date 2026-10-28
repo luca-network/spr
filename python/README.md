@@ -19,11 +19,22 @@ record = book.seal(rail="x402", source_id=tx_hash, amount_minor=10000, currency=
 
 The folder, files and records are the same as the JavaScript SDK's, so either language opens the other's book.
 
-Check a package, or run the test vectors:
+The book runs on your machine and makes no call to Luca. A check against the book's own `mandate.json` reports `authority: "self-declared"`, because whoever keeps the book writes it. Times need their offset; a time without one is refused. Different facts for a payment already sealed return `conflict` and seal nothing, unless you pass `correction={"reason": ...}`.
+
+Check a package, or run the test vectors that come with the package:
 
 ```
 python -m spr <package folder>
-python -m spr --vectors ../packages/spr/vectors/vectors.json
+python -m spr --vectors
 ```
+
+Send the book to Luca's hosted service (optional), which checks every seal, then classifies each payment and posts it to your ERP:
+
+```python
+book.register_with_luca("acme-us", url="https://sandbox.luca.network", api_key=FINANCE_KEY)   # once; a second person approves it in Luca
+book.send_to_luca(url="https://sandbox.luca.network", api_key=LUCA_API_KEY)                    # sending it again changes nothing
+```
+
+`url` and `api_key` default to `LUCA_URL` and `LUCA_API_KEY`. Only the package's files are sent, never the private key.
 
 Tests: `python -m unittest discover -s tests`, from this folder.

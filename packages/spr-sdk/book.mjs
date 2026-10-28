@@ -8,24 +8,37 @@
 //                      against the intent's window and cap.
 // label(record) seals the company's side of the label the counterparty can confirm (SPR section 7).
 //
-// No call to Luca. Everything follows SPR (../../lib/spr/SPEC.md), so anyone can check the folder or an
+// No call to Luca, unless you send the book there yourself (sendToLuca). Everything follows SPR (../../lib/spr/SPEC.md), so anyone can check the folder or an
 // export of it with spr-verify and no Luca code. The folder:
 //   key.pem              the company's Ed25519 key (created on first use, readable by its owner only), unless
 //                        a key is passed in, for example from the operating system's keychain
 //   keys.jsonl           its public key, and any earlier ones
 //   intents.jsonl, cancellations.jsonl, checks.jsonl, records.jsonl, labels.jsonl   each sealed: { payload, seal }
 //   mandate.json         optional: the limits the agent acts under (currency, per payment, validity)
-import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, copyFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import * as L from "@luca-network/spr";
 
-export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.0" };
+export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.1" };
 const RECORD_SCHEMA = "luca.record/0.7";   // SPR section 6; the hosted service seals the same schema
 const INTENT_SCHEMA = "luca.intent/0.1";
 const CLOCK_SKEW_MS = 2 * 60_000;
 
 const iso = (d) => d.toISOString().replace(/\.000Z$/, "Z");
+// A time the agent gives must carry its offset. Without one, JavaScript reads it in this computer's time zone,
+// so the same input would seal a different instant on a machine set to another zone.
+const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+function instant(value, what) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  if (typeof value !== "string" || !INSTANT.test(value))
+    throw new Error(`${what} must be an ISO 8601 time with its offset, such as 2026-10-28T12:00:00Z or 2026-10-28T12:00:00-07:00. ` +
+      `${JSON.stringify(value)} has none, so it could be any time zone`);
+  return new Date(value);
+}
+// What a local book's limits are: mandate.json is written by whoever keeps the book, so a check against it shows
+// the agent stayed inside limits the company's own folder declares. It is not authority granted by someone else.
+export const SELF_DECLARED = "self-declared";
 const hex = (n) => randomBytes(n).toString("hex");
 function durationMs(s) {
   const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$/.exec(s ?? "");
@@ -77,13 +90,13 @@ export class SprBook {
   // The mandate's limits, checked against the most the agent could pay.
   mandateChecks(amount, currency, at) {
     const m = this.mandate();
-    if (!m) return { decision: "no_mandate", checks: [], mandate_id: null };
+    if (!m) return { decision: "none", authority: "none", checks: [], mandate_id: null };
     const checks = [];
     if (m.currency) checks.push({ check: "currency", ok: !currency || currency === m.currency, detail: `Mandate in ${m.currency}; intent in ${currency ?? "no currency"}` });
     if (m.max_per_payment_minor !== undefined) checks.push({ check: "per_payment", ok: amount === null || amount <= m.max_per_payment_minor, detail: `Limit ${m.max_per_payment_minor}; up to ${amount ?? "no amount given"}` });
     if (m.valid_from || m.valid_until) checks.push({ check: "in_date", ok: (!m.valid_from || at >= new Date(m.valid_from)) && (!m.valid_until || at <= new Date(m.valid_until)),
       detail: `Valid ${m.valid_from ?? "any time"} to ${m.valid_until ?? "no end"}` });
-    return { decision: checks.every((c) => c.ok) ? "within_mandate" : "outside_mandate", checks, mandate_id: m.mandate_id ?? null };
+    return { decision: checks.every((c) => c.ok) ? "within_mandate" : "outside_mandate", authority: SELF_DECLARED, checks, mandate_id: m.mandate_id ?? null };
   }
 
   // ---- before paying ----
@@ -104,13 +117,13 @@ export class SprBook {
       expected_amount_minor: input.expected_amount_minor ?? null, max_amount_minor: cap, currency,
       rail: input.rail ?? null, rail_ref: input.rail_ref ?? null, terms: input.terms ?? null,
       declared_at: iso(now), expires_at: iso(new Date(now.getTime() + ttl)),
-      precheck: { decision: pre.decision, checks: pre.checks }, producer: this.cfg.producer,
+      precheck: { decision: pre.decision, authority: pre.authority, checks: pre.checks }, producer: this.cfg.producer,
     };
     const row = this.sealRow(payload);
     this.append("intents.jsonl", row);
     this.intents.set(payload.intent_id, row);
     return {
-      intent_id: payload.intent_id, decision: pre.decision, checks: pre.checks, declared_at: payload.declared_at, expires_at: payload.expires_at,
+      intent_id: payload.intent_id, decision: pre.decision, authority: pre.authority, checks: pre.checks, declared_at: payload.declared_at, expires_at: payload.expires_at,
       max_amount_minor: cap, seal: row.seal,
       binding: this.cfg.binding ? { scheme: L.INTENT_NONCE_SCHEME, nonce: L.intentNonce(row.seal.payload_sha256) } : null,
     };
@@ -163,9 +176,9 @@ export class SprBook {
     const row = this.sealRow({ schema: "luca.payment-check/0.1", id: `pck_${hex(8)}`, checked_at: iso(now), agent: this.cfg.agentId,
       request: { ...input },
      
-      decision: checks.every((c) => c.ok) ? "approve" : "decline", checks, producer: this.cfg.producer });
+      decision: checks.every((c) => c.ok) ? "approve" : "decline", authority: m.authority, checks, producer: this.cfg.producer });
     this.append("checks.jsonl", row);
-    return { id: row.payload.id, decision: row.payload.decision, checks, reasons: checks.filter((c) => !c.ok).map((c) => `${c.check}: ${c.detail}`), seal: row.seal };
+    return { id: row.payload.id, decision: row.payload.decision, authority: m.authority, checks, reasons: checks.filter((c) => !c.ok).map((c) => `${c.check}: ${c.detail}`), seal: row.seal };
   }
 
 
@@ -203,26 +216,39 @@ export class SprBook {
   recordSettlement(input) {
     if (!input?.rail || !input.source_id) throw new Error("rail and source_id are required");
     if (!Number.isSafeInteger(input.amount_minor)) throw new Error("amount_minor must be an integer in minor units");
-    const at = new Date(input.occurred_at ?? this.now());
-    if (!input.currency || Number.isNaN(at.getTime())) throw new Error("currency and occurred_at (ISO 8601) are required");
+    if (!input.currency) throw new Error("currency is required");
     const currency = input.currency.toUpperCase();
     const sourceId = /^0x[0-9a-f]+$/i.test(input.source_id) ? input.source_id.toLowerCase() : input.source_id;
+    const key = `${this.cfg.entity}:${input.rail}:${sourceId}`;
+    const earlier = this.current().find((r) => `${r.payload.entity}:${r.payload.rail}:${r.payload.source.id}` === key) ?? null;
+    // Without occurred_at the record says so and takes the time of sealing; a retry keeps the time first sealed.
+    const timeGiven = input.occurred_at !== undefined && input.occurred_at !== null;
+    const at = timeGiven ? instant(input.occurred_at, "occurred_at") : earlier ? new Date(earlier.payload.occurred_at) : this.now();
+    const timeNote = timeGiven ? null : earlier ? (earlier.payload.occurred_at_source ?? null) : "not given: the time the book sealed it";
     const nonce = (input.nonce ?? input.x402?.authorization?.nonce ?? null)?.toLowerCase() ?? null;
     const i = this.intentFor(input.intent_id, nonce);
     if (input.intent_id && !i) throw new Error(`No intent ${input.intent_id} in this book`);
     const direction = input.direction ?? "outflow";
     const consent = i && direction === "outflow" ? this.consent(i, { at, amount: input.amount_minor, currency, nonce }) : null;
 
-    const key = `${this.cfg.entity}:${input.rail}:${sourceId}`;
-    const earlier = this.current().find((r) => `${r.payload.entity}:${r.payload.rail}:${r.payload.source.id}` === key) ?? null;
     const facts = {
       direction, state: input.amount_minor < 0 ? "refunded" : input.state === "pending" ? "pending" : "cleared",
       amount_minor: input.amount_minor, currency, occurred_at: iso(at), counterparty: input.counterparty ?? null,
       memo: input.memo ?? null, intent: i ? { intent_id: i.payload.intent_id, payload_sha256: i.seal.payload_sha256 } : null,
     };
+    // The same facts again are a retry. Different facts under the same payment are a correction, and need a reason;
+    // only a pending payment clearing is taken as it comes.
+    let correction = null;
     if (earlier) {
-      const same = Object.entries(facts).every(([k, v]) => L.canonicalize(v ?? null) === L.canonicalize(earlier.payload[k] ?? null));
-      if (same) return { status: "unchanged", record_id: earlier.payload.record_id, seal: earlier.seal };
+      const changed = Object.keys(facts).filter((k) => L.canonicalize(facts[k] ?? null) !== L.canonicalize(earlier.payload[k] ?? null));
+      if (!changed.length) return { status: "unchanged", record_id: earlier.payload.record_id, seal: earlier.seal };
+      const clearing = changed.length === 1 && changed[0] === "state" && earlier.payload.state === "pending";
+      const reason = typeof input.correction?.reason === "string" ? input.correction.reason.trim() : "";
+      if (!clearing && !reason)
+        return { status: "conflict", record_id: earlier.payload.record_id, sealed: false,
+          differs: changed.map((k) => ({ field: k, sealed: earlier.payload[k] ?? null, given: facts[k] ?? null })),
+          how: "Nothing was sealed. If the sealed record is wrong, call again with correction: { reason }. If this is another payment, give it its own source_id." };
+      if (reason) correction = { reason };
     }
     const version = earlier ? earlier.payload.version + 1 : 1;
     const payload = {
@@ -233,6 +259,8 @@ export class SprBook {
       entity: this.cfg.entity, entity_id: this.cfg.entity, rail: input.rail, reported_by: "agent",
       source: { id: sourceId, payload_sha256: L.hashSourcePayload(input) },
       ...facts,
+      ...(timeNote ? { occurred_at_source: timeNote } : {}),
+      ...(correction ? { correction } : {}),
       time_zone: this.cfg.timeZone, settled_on: this.localDate(at),
       agent: { id: this.cfg.agentId, owner: this.cfg.owner },
       rail_authorization: nonce ? [{ scheme: `${input.rail}_payment`, reference: nonce }] : [],
@@ -300,15 +328,51 @@ export class SprBook {
       within_consent: r.payload.consent?.within_consent ?? null, payload_sha256: r.seal.payload_sha256 }));
   }
 
+  // The book's public key: what finance registers with Luca once, so the book can be sent (sendToLuca).
+  publicKey() { return { key_id: this.keyId, public_pem: L.publicKeyPemOf(this.key), entity: this.cfg.entity, agent_id: this.cfg.agentId }; }
+
+  // The book as a package (SPR section 8): each file by name, as text, with a sealed manifest of their hashes.
+  packageFiles() {
+    const names = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"].filter((n) => existsSync(join(this.dir, n)));
+    const files = Object.fromEntries(names.map((n) => [n, readFileSync(join(this.dir, n), "utf8")]));
+    const pkg = { schema: "luca.local-package/0.1", entity: this.cfg.entity, generated_at: iso(this.now()), producer: this.cfg.producer, format: L.SPEC_VERSION,
+      files: names.map((name) => ({ name, sha256: L.sha256Hex(Buffer.from(files[name], "utf8")) })) };
+    files["manifest.json"] = JSON.stringify({ package: pkg, seal: L.sealWith(pkg, this.key) }, null, 2) + "\n";
+    return files;
+  }
+
   // A copy of the book for an auditor, a counterparty or Luca: the files and a sealed manifest of their hashes.
   exportPackage(outDir) {
     mkdirSync(outDir, { recursive: true });
-    const names = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"].filter((n) => existsSync(join(this.dir, n)));
-    for (const n of names) copyFileSync(join(this.dir, n), join(outDir, n));
-    const pkg = { schema: "luca.local-package/0.1", entity: this.cfg.entity, generated_at: iso(this.now()), producer: this.cfg.producer, format: L.SPEC_VERSION,
-      files: names.map((name) => ({ name, sha256: L.sha256Hex(readFileSync(join(outDir, name))) })) };
-    writeFileSync(join(outDir, "manifest.json"), JSON.stringify({ package: pkg, seal: L.sealWith(pkg, this.key) }, null, 2) + "\n");
+    const files = this.packageFiles();
+    for (const [n, text] of Object.entries(files)) writeFileSync(join(outDir, n), text);
     const check = L.verifyPackage((n) => existsSync(join(outDir, n)) ? readFileSync(join(outDir, n)) : null);
-    return { folder: outDir, files: [...names, "manifest.json"], verified: check.ok, passed: check.passed, failed: check.failed };
+    return { folder: outDir, files: Object.keys(files), verified: check.ok, passed: check.passed, failed: check.failed };
   }
+
+  // ---- Luca, the hosted service (optional) ----
+  // Sends the book to Luca, which checks every seal before it stores anything, then classifies each payment, posts
+  // it to the company's ERP and keeps it in the hourly evidence. The book's key must be registered first
+  // (registerWithLuca, approved by a second person in finance). Sending the same book again changes nothing.
+  async sendToLuca(opts = {}) {
+    return lucaCall(opts, "/v1/spr/import", { files: this.packageFiles() });
+  }
+  // Asks Luca to accept this book's key for one of the company's entities. Needs a finance user's key; the
+  // request waits until a second person approves it. agentOnly limits the key to this book's agent.
+  async registerWithLuca(opts = {}) {
+    const k = this.publicKey();
+    return lucaCall(opts, "/v1/spr/keys", { public_pem: k.public_pem, entity_id: opts.entityId, book_entity: this.cfg.entity,
+      ...(opts.agentOnly ? { agent_id: this.cfg.agentId } : {}) });
+  }
+}
+
+async function lucaCall(opts, path, body) {
+  const url = opts.url ?? process.env.LUCA_URL;
+  const apiKey = opts.apiKey ?? process.env.LUCA_API_KEY;
+  if (!url || !apiKey) throw new Error("Give Luca's address and an API key: { url, apiKey }, or LUCA_URL and LUCA_API_KEY");
+  const res = await (opts.fetch ?? globalThis.fetch)(new URL(path, url).toString(), {
+    method: "POST", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(out?.error ?? `Luca answered ${res.status}`), { status: res.status, detail: out });
+  return out;
 }

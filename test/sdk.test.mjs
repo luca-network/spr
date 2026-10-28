@@ -167,3 +167,79 @@ assert b.export_package(${JSON.stringify(join(dir, "export-py"))})["verified"]`)
     assert.equal(js.failed, 0, JSON.stringify(js.results.filter((r) => !r.ok)));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("sendToLuca: the book goes as a package whose sealed manifest checks with the SPR library alone; Luca's refusal comes back as an error", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spr-send-"));
+  try {
+    const book = new SprBook({ dir, agentId: "agt_research", entity: "Example Co" });
+    book.seal({ rail: "stripe", source_id: "pi_1", amount_minor: 4900, currency: "USD" });
+    const sent = [];
+    const fetch = async (url, init) => {
+      sent.push({ url, init });
+      return new Response(JSON.stringify(url.endsWith("/v1/spr/import") ? { import_id: "spi_1", created: 1 } : { change: { id: "chg_1", status: "pending" } }), { status: 201 });
+    };
+    assert.equal((await book.sendToLuca({ url: "https://luca.example", apiKey: "k_1", fetch })).created, 1);
+    assert.equal(sent[0].url, "https://luca.example/v1/spr/import");
+    assert.equal(sent[0].init.headers.authorization, "Bearer k_1");
+    const files = JSON.parse(sent[0].init.body).files;
+    assert.deepEqual(Object.keys(files).sort(), ["keys.jsonl", "manifest.json", "records.jsonl"]);
+    assert.ok(spr.verifyPackage((n) => files[n] === undefined ? null : Buffer.from(files[n])).ok);
+    assert.ok(!Object.values(files).some((t) => /PRIVATE KEY/.test(t)), "the private key never leaves the machine");
+
+    await book.registerWithLuca({ url: "https://luca.example", apiKey: "k_fin", fetch, entityId: "ent_1" });
+    const reg = JSON.parse(sent[1].init.body);
+    assert.equal(reg.public_pem, book.publicKey().public_pem);
+    assert.equal(reg.entity_id, "ent_1");
+
+    const refuse = async () => new Response(JSON.stringify({ error: "Key ed25519:x is not registered with Luca" }), { status: 403 });
+    await assert.rejects(book.sendToLuca({ url: "https://luca.example", apiKey: "k_1", fetch: refuse }), (e) => e.status === 403 && /not registered/.test(e.message));
+    await assert.rejects(book.sendToLuca({ fetch }), /LUCA_URL/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("times: one without its offset is refused; the accounting date follows the book's time zone (UTC by default), whatever the computer's", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spr-time-"));
+  try {
+    const book = new SprBook({ dir, agentId: "agt_t", entity: "Example Co" });
+    assert.throws(() => book.seal({ rail: "stripe", source_id: "pi_1", amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00" }), /offset/);
+    assert.equal(book.listRecords().length, 0);
+    book.seal({ rail: "stripe", source_id: "pi_2", amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T23:30:00-07:00" });
+    const p = JSON.parse(readFileSync(join(dir, "records.jsonl"), "utf8").trim().split("\n").pop()).payload;
+    assert.deepEqual([p.occurred_at, p.time_zone, p.settled_on], ["2026-10-29T06:30:00Z", "UTC", "2026-10-29"]);
+    const la = new SprBook({ dir: join(dir, "la"), agentId: "agt_t", entity: "Example Co", timeZone: "America/Los_Angeles" });
+    la.seal({ rail: "stripe", source_id: "pi_2", amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T23:30:00-07:00" });
+    assert.equal(la.listRecords()[0].settled_on, "2026-10-28");
+    // No time: the record says so, and a retry keeps the first time. The agent tools insist on one.
+    la.seal({ rail: "stripe", source_id: "pi_3", amount_minor: 100, currency: "USD" });
+    const p3 = JSON.parse(readFileSync(join(dir, "la", "records.jsonl"), "utf8").trim().split("\n").pop()).payload;
+    assert.equal(p3.occurred_at_source, "not given: the time the book sealed it");
+    assert.equal(la.seal({ rail: "stripe", source_id: "pi_3", amount_minor: 100, currency: "USD" }).status, "unchanged");
+    const settle = sprTools(la).find((t) => t.name === "record_settlement");
+    assert.throws(() => settle.run({ rail: "stripe", source_id: "pi_4", amount_minor: 100, currency: "USD" }), /occurred_at is required/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("authority: the book's own limits are reported as self-declared; a book's folder checks as a book; a package holding the private key fails", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spr-auth-"));
+  try {
+    const book = new SprBook({ dir, agentId: "agt_a", entity: "Example Co" });
+    const i = book.declare({ purpose: "Data", max_amount_minor: 500, currency: "USD" });
+    assert.deepEqual([i.decision, i.authority], ["none", "none"]);
+    const { writeFileSync, copyFileSync } = await import("node:fs");
+    writeFileSync(join(dir, "mandate.json"), JSON.stringify({ currency: "USD", max_per_payment_minor: 1000 }));
+    const c = book.checkPayment({ amount_minor: 400, currency: "USD", intent_id: i.intent_id });
+    assert.deepEqual([c.decision, c.authority], ["approve", "self-declared"]);
+    book.seal({ rail: "stripe", source_id: "pi_1", amount_minor: 400, currency: "USD", occurred_at: "2026-10-28T12:00:00Z", intent_id: i.intent_id });
+    const read = (d) => (n) => existsSync(join(d, n)) ? readFileSync(join(d, n)) : null;
+    const asBook = spr.verifyPackage(read(dir));
+    assert.equal(asBook.kind, "book");
+    assert.equal(asBook.ok, true, JSON.stringify(asBook.results.filter((r) => !r.ok)));
+    const exp = join(dir, "export");
+    book.exportPackage(exp);
+    assert.equal(spr.verifyPackage(read(exp)).kind, "package");
+    copyFileSync(join(dir, "key.pem"), join(exp, "key.pem"));
+    const leaked = spr.verifyPackage(read(exp));
+    assert.equal(leaked.ok, false);
+    assert.ok(leaked.results.some((r) => r.what === "the package holds no private key" && !r.ok));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

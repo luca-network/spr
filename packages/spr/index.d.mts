@@ -45,5 +45,5 @@ export declare const INTENT_SCHEMA_PATTERN: RegExp;
 export declare function checkRecord(payload: unknown): CoreCheck;
 export declare function checkIntent(payload: unknown): CoreCheck;
 
-export interface PackageCheck { ok: boolean; passed: number; failed: number; results: { what: string; ok: boolean; detail: string }[] }
+export interface PackageCheck { kind: "book" | "package"; ok: boolean; passed: number; failed: number; results: { what: string; ok: boolean; detail: string }[] }
 export declare function verifyPackage(read: (name: string) => Buffer | null): PackageCheck;

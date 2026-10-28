@@ -87,6 +87,8 @@ An intent is what an agent declares before paying. It is sealed with the company
 
 An intent MAY also carry the agent, the mandate, the counterparty, the expected amount, the rail, the rail reference, the exact terms of the purchase and the pre-check against the mandate.
 
+**What a check against a book's own limits shows.** A company's book MAY hold limits for its agent (`mandate.json` in the SDKs). Whoever keeps the book writes them, so a check against them shows that the agent stayed inside limits the book declares. Producers report it as `authority: "self-declared"`, and `"none"` where the book holds no limits. It does not show that anyone else granted that authority. Authority granted by another party needs that party's own record or signature: a mandate approved in a hosted service, or one signed with a principal's key.
+
 **The intent nonce.** Where a rail lets the payer choose a value that the rail records at settlement (the nonce of an EIP-3009 transfer authorization, a Permit2 nonce or witness, a memo, a payment reference), the payer MAY use the intent nonce:
 
 ```
@@ -116,7 +118,7 @@ A record is the company's own accounting record of one payment. It is sealed wit
 | `state` | the payment's state: `cleared`, `pending`, `refunded` and so on |
 | `amount_minor` | what moved on the rail to or from the entity, an integer in the currency's minor unit (cents; 6 decimals for USDC) |
 | `currency` | the currency or token |
-| `occurred_at` | an ISO 8601 instant with its offset, or null where the rail gives no time |
+| `occurred_at` | an ISO 8601 instant with its offset, or null where the rail gives no time. A producer MUST refuse a time given without an offset rather than read it in its own time zone. Where no time is given it MAY use the time of sealing, and then SHOULD say so in `occurred_at_source` |
 | `settled_on` | the accounting date, `YYYY-MM-DD`, in the entity's time zone, or null |
 | `intent.intent_id` | where the payment was made under an intent: the intent's ID, with `intent.payload_sha256` its sealed hash |
 
@@ -131,6 +133,8 @@ A record MAY carry any other member. Luca's records carry, among others:
 A reader MUST keep members it does not understand, because the seal covers them.
 
 **Corrections.** When the facts of a payment change (the rail confirms a different amount, a classification is corrected), the producer seals a new version with `version` one higher and `supersedes` naming the version replaced. In a set of records, every version a record names in `supersedes` SHOULD be present, and the current version of a payment is the one no other version supersedes.
+
+Where the payments come from an agent and not from a rail's own feed, a changed retry and a deliberate correction look alike. Such a producer SHOULD return the sealed record unchanged when it is given the same facts again. It SHOULD refuse different facts for a payment already sealed unless the caller gives a reason, and seal that reason in the new version as `correction.reason`. A pending payment that clears needs no reason.
 
 ## 7. Two-sided labels
 
@@ -157,7 +161,7 @@ The counterparty signs with a key it registered with the company, which MUST be 
 
 ## 8. Local packages
 
-A package is a folder of files that can be checked with nothing but this format. The MCP server's local mode keeps one, and exports copies of it.
+A package is a folder of files that can be checked with nothing but this format. The SDKs and the MCP server keep a company's book in a folder and export packages from it.
 
 | File | Contents |
 |---|---|
@@ -176,6 +180,8 @@ A checker of a package MUST check:
 - that every superseded version is in the package;
 - that each record's intent is in the package with the hash the record names;
 - for a record whose consent check carries a nonce, that it is marked bound exactly when the nonce equals the intent nonce (section 5).
+
+A book's own folder also holds its private key (`key.pem` in the SDKs) and no manifest. A checker MAY check it as a book (every seal and core field, with no manifest) and SHOULD say to share an export instead. A package MUST NOT contain a private key, and a checker MUST fail one that does.
 
 Luca's monthly audit package (`luca.audit-package/1`, checked by `verifier/luca-verify.mjs`) is a larger package of the same kind. It adds journal entries with their records roots, sealed rail-read windows, hourly evidence with outside timestamps, and the company's sealed completeness statement.
 

@@ -39,9 +39,30 @@ res.luca.record;   // sealed, matched to its intent, bound on chain
 npx spr-verify ./books-export          # a package of records
 npx spr-verify --vectors               # the library against the test vectors
 python -m spr ./books-export
+python -m spr --vectors                # the Python SDK against the same vectors
 ```
 
 An implementation in any language conforms when it gives the same answers as `packages/spr/vectors/vectors.json`.
+
+## Local SPR and hosted Luca
+
+The packages here run on your own machine and make no call to Luca. Luca's hosted service is a separate product that a book can be sent to.
+
+| | Local SPR (these packages) | Hosted Luca |
+|---|---|---|
+| Where it runs | Your machine, your folder, your key | Luca's service |
+| What it records | The intent before paying and the payment after, as the agent reports them | The same, plus the payment as the rail itself reports it |
+| Limits it checks | The intent's cap and expiry, and the book's own `mandate.json`, which whoever keeps the book writes (`authority: "self-declared"`) | Mandates finance approves in Luca, checked before and after each payment |
+| Confirmation from the rail | None: the record is what the agent reported | The payment read from the rail, and any difference flagged |
+| Accounting | None | Classification to your accounts (US GAAP, IFRS, tax), journal entries posted to your ERP, the month's close |
+| Evidence | Seals anyone can check with `spr-verify` or `python -m spr` | Hourly evidence with outside timestamps, and the audit package |
+| Cost | Free, Apache-2.0 | A Luca account |
+
+A book moves across with one call once finance has registered its key: `book.sendToLuca()`. Luca checks every seal before it stores anything.
+
+## Send the book to Luca (optional)
+
+A finance user registers the book's key once (`book.registerWithLuca`), a second person approves it, and then `book.sendToLuca()` sends the book. Luca checks every seal before it stores anything, and sending the same book again changes nothing. Write to hello@luca.network for an account.
 
 ## Status
 

@@ -2,6 +2,8 @@
 
 SPR, the Sealed Payment Record, as an MCP server. Any MCP client (Claude Desktop, Cursor, your own agent) can declare each payment before making it, check it, and seal the record afterwards. Records are sealed with your company's own key, in a folder on your own machine, with no call to Luca. Apache-2.0.
 
+This server runs on your machine and makes no call to Luca, unless you add `LUCA_URL` and `LUCA_API_KEY` for `send_to_luca`. Its checks are against the intent and the book's own `mandate.json`, which whoever keeps the book writes, so results say `authority: "self-declared"`. Confirmation from the rail, ERP posting and mandates approved by finance are Luca's hosted service: see "Local SPR and hosted Luca" in the repository's README.
+
 ## Claude Desktop
 
 Add this to `claude_desktop_config.json`:
@@ -30,6 +32,7 @@ Add this to `claude_desktop_config.json`:
 | `verify_record` | Check a record's seal |
 | `list_records` | The book's current records |
 | `export_package` | A copy of the book with a sealed manifest, for an auditor or a counterparty |
+| `send_to_luca` | Send the book to Luca's hosted service (only when `LUCA_URL` and `LUCA_API_KEY` are set) |
 
 Check an export with `npx spr-verify <folder>`, with no Luca code.
 
@@ -43,5 +46,6 @@ Check an export with `npx spr-verify <folder>`, with no Luca code.
 | `SPR_OWNER` | The person responsible for the agent |
 | `SPR_TIME_ZONE` | The company's time zone, for accounting dates (default UTC) |
 | `SPR_BINDING` | `on` to return the nonce to sign with each intent |
+| `LUCA_URL`, `LUCA_API_KEY` | Optional: Luca's address and an API key, which add the `send_to_luca` tool |
 
 The folder holds the company's private key (`key.pem`). Keep it out of source control.

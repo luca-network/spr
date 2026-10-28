@@ -354,6 +354,12 @@ def verify_package(read: Callable[[str], Optional[bytes]]) -> dict:
     def jsonl(name):
         b = read(name)
         return [json.loads(l) for l in b.decode("utf-8").split("\n") if l.strip()] if b else []
+    holds_key = bool(read("key.pem"))
+    kind = "book" if holds_key and not read("manifest.json") else "package"
+    if kind == "book":
+        check("this is a book's own folder: its seals and fields are checked below; it holds the private key, so share an export of it instead", True)
+    elif holds_key:
+        check("the package holds no private key", False, "key.pem is a private key and must never be shared")
     keys = {k["key_id"]: k for k in jsonl("keys.jsonl")}
     def seal_ok(payload, seal):
         s = normalize_seal(seal or {})
@@ -363,7 +369,7 @@ def verify_package(read: Callable[[str], Optional[bytes]]) -> dict:
         v = verify_seal(payload, s, k["public_pem"], k.get("algorithm") or s["algorithm"])
         return v["ok"], "" if v["ok"] else ("the payload's hash is not the sealed hash" if not v["hash_matches"] else "the signature does not verify with that key")
     mb = read("manifest.json")
-    if check("manifest.json is present", bool(mb)):
+    if kind == "package" and check("manifest.json is present", bool(mb)):
         m = json.loads(mb.decode("utf-8"))
         ok, why = seal_ok(m.get("package"), m.get("seal"))
         check("the manifest is sealed", ok, why)
@@ -399,7 +405,7 @@ def verify_package(read: Callable[[str], Optional[bytes]]) -> dict:
                 expected = intent_nonce(normalize_seal(i["seal"])["payload_sha256"], b["seq"] if isinstance(b.get("seq"), int) else 0)
                 check(f"record {p['record_id']}: bound only when the nonce is the intent's fingerprint", (b.get("status") == "bound") == (b["nonce"].lower() == expected), f"expected {expected}")
     failed = sum(1 for r in results if not r["ok"])
-    return {"ok": failed == 0, "passed": len(results) - failed, "failed": failed, "results": results}
+    return {"kind": kind, "ok": failed == 0, "passed": len(results) - failed, "failed": failed, "results": results}
 
 
 # ---- the vectors -----------------------------------------------------------------------------------------

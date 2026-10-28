@@ -14,7 +14,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -24,7 +23,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from . import format as L
 
-SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.0"}
+SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.1"}
 RECORD_SCHEMA = "luca.record/0.7"
 INTENT_SCHEMA = "luca.intent/0.1"
 CLOCK_SKEW = timedelta(minutes=2)
@@ -40,6 +39,26 @@ def _iso(d: datetime) -> str:
 
 def _parse(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+_INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})")
+
+
+def _instant(value, what: str) -> datetime:
+    """A time the agent gives must carry its offset. Without one, Python reads it in this computer's time zone."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            raise ValueError(f"{what} must carry its time zone: a datetime without tzinfo could be any time zone")
+        return value
+    if not isinstance(value, str) or not _INSTANT.fullmatch(value):
+        raise ValueError(f"{what} must be an ISO 8601 time with its offset, such as 2026-10-28T12:00:00Z or 2026-10-28T12:00:00-07:00. "
+                         f"{json.dumps(value)} has none, so it could be any time zone")
+    return _parse(value)
+
+
+# A local book's limits (mandate.json) are written by whoever keeps the book, so a check against them shows the agent
+# stayed inside limits the company's own folder declares. It is not authority granted by someone else.
+SELF_DECLARED = "self-declared"
 
 
 def _duration(s: str) -> timedelta:
@@ -107,7 +126,7 @@ class SprBook:
     def _mandate_checks(self, amount, currency, at):
         m = self._mandate()
         if not m:
-            return {"decision": "no_mandate", "checks": [], "mandate_id": None}
+            return {"decision": "none", "authority": "none", "checks": [], "mandate_id": None}
         checks = []
         if m.get("currency"):
             checks.append({"check": "currency", "ok": not currency or currency == m["currency"], "detail": f"Mandate in {m['currency']}; intent in {currency or 'no currency'}"})
@@ -116,7 +135,8 @@ class SprBook:
         if m.get("valid_from") or m.get("valid_until"):
             ok = (not m.get("valid_from") or at >= _parse(m["valid_from"])) and (not m.get("valid_until") or at <= _parse(m["valid_until"]))
             checks.append({"check": "in_date", "ok": ok, "detail": f"Valid {m.get('valid_from') or 'any time'} to {m.get('valid_until') or 'no end'}"})
-        return {"decision": "within_mandate" if all(c["ok"] for c in checks) else "outside_mandate", "checks": checks, "mandate_id": m.get("mandate_id")}
+        return {"decision": "within_mandate" if all(c["ok"] for c in checks) else "outside_mandate", "authority": SELF_DECLARED, "checks": checks,
+                "mandate_id": m.get("mandate_id")}
 
     # ---- before paying ----
     def declare(self, purpose: str, max_amount_minor: Optional[int] = None, currency: Optional[str] = None, counterparty: Optional[str] = None,
@@ -138,13 +158,13 @@ class SprBook:
             "agent": {"id": self.agent_id, "owner": self.owner}, "entity": self.entity, "mandate_id": pre.get("mandate_id"),
             "purpose": purpose.strip(), "counterparty": counterparty, "expected_amount_minor": expected_amount_minor,
             "max_amount_minor": cap, "currency": cur, "rail": rail, "rail_ref": rail_ref, "terms": terms,
-            "declared_at": _iso(now), "expires_at": _iso(now + ttl), "precheck": {"decision": pre["decision"], "checks": pre["checks"]},
+            "declared_at": _iso(now), "expires_at": _iso(now + ttl), "precheck": {"decision": pre["decision"], "authority": pre["authority"], "checks": pre["checks"]},
             "producer": self.producer,
         }
         row = self._seal_row(payload)
         self._append("intents.jsonl", row)
         self.intents[payload["intent_id"]] = row
-        return {"intent_id": payload["intent_id"], "decision": pre["decision"], "checks": pre["checks"], "declared_at": payload["declared_at"],
+        return {"intent_id": payload["intent_id"], "decision": pre["decision"], "authority": pre["authority"], "checks": pre["checks"], "declared_at": payload["declared_at"],
                 "expires_at": payload["expires_at"], "max_amount_minor": cap, "seal": row["seal"],
                 "binding": {"scheme": L.INTENT_NONCE_SCHEME, "nonce": L.intent_nonce(row["seal"]["payload_sha256"])} if self.binding else None}
 
@@ -222,9 +242,9 @@ class SprBook:
         request = {"amount_minor": amount_minor, "currency": currency, "counterparty": counterparty, "intent_id": intent_id, "nonce": nonce}
         row = self._seal_row({"schema": "luca.payment-check/0.1", "id": "pck_" + secrets.token_hex(8), "checked_at": _iso(now), "agent": self.agent_id,
                               "request": {k: v for k, v in request.items() if v is not None}, "decision": "approve" if all(c["ok"] for c in checks) else "decline",
-                              "checks": checks, "producer": self.producer})
+                              "authority": m["authority"], "checks": checks, "producer": self.producer})
         self._append("checks.jsonl", row)
-        return {"id": row["payload"]["id"], "decision": row["payload"]["decision"], "checks": checks,
+        return {"id": row["payload"]["id"], "decision": row["payload"]["decision"], "authority": m["authority"], "checks": checks,
                 "reasons": [f"{c['check']}: {c['detail']}" for c in checks if not c["ok"]], "seal": row["seal"]}
 
     def _current(self):
@@ -234,27 +254,46 @@ class SprBook:
     # ---- after paying ----
     def seal(self, rail: str, source_id: str, amount_minor: int, currency: str, occurred_at: Optional[str] = None, counterparty: Optional[str] = None,
              intent_id: Optional[str] = None, memo: Optional[str] = None, state: Optional[str] = None, direction: str = "outflow",
-             nonce: Optional[str] = None, evidence: Optional[dict] = None,
+             nonce: Optional[str] = None, evidence: Optional[dict] = None, correction: Optional[dict] = None,
              ) -> dict:
         if not rail or not source_id:
             raise ValueError("rail and source_id are required")
         if not L._safe_int(amount_minor):
             raise ValueError("amount_minor must be an integer in minor units")
-        at = _parse(occurred_at) if occurred_at else self._now()
+        if not currency:
+            raise ValueError("currency is required")
         cur = currency.upper()
         src = source_id.lower() if re.fullmatch(r"0x[0-9a-fA-F]+", source_id) else source_id
+        key = f"{self.entity}:{rail}:{src}"
+        earlier = next((r for r in self._current() if f"{r['payload']['entity']}:{r['payload']['rail']}:{r['payload']['source']['id']}" == key), None)
+        # Without occurred_at the record says so and takes the time of sealing; a retry keeps the time first sealed.
+        given = occurred_at is not None
+        at = _instant(occurred_at, "occurred_at") if given else _parse(earlier["payload"]["occurred_at"]) if earlier else self._now()
+        time_note = None if given else (earlier["payload"].get("occurred_at_source") if earlier else "not given: the time the book sealed it")
         nonce = nonce.lower() if nonce else None
         i = self._intent_for(intent_id, nonce)
         if intent_id and not i:
             raise KeyError(f"No intent {intent_id} in this book")
         consent = self._consent(i, at, amount_minor, cur, nonce) if i and direction == "outflow" else None
-        key = f"{self.entity}:{rail}:{src}"
-        earlier = next((r for r in self._current() if f"{r['payload']['entity']}:{r['payload']['rail']}:{r['payload']['source']['id']}" == key), None)
         facts = {"direction": direction, "state": "refunded" if amount_minor < 0 else "pending" if state == "pending" else "cleared",
                  "amount_minor": amount_minor, "currency": cur, "occurred_at": _iso(at), "counterparty": counterparty, "memo": memo,
                  "intent": {"intent_id": i["payload"]["intent_id"], "payload_sha256": i["seal"]["payload_sha256"]} if i else None}
-        if earlier and all(L.canonicalize(v) == L.canonicalize(earlier["payload"].get(k)) for k, v in facts.items()):
-            return {"status": "unchanged", "record_id": earlier["payload"]["record_id"], "seal": earlier["seal"]}
+        # The same facts again are a retry. Different facts under the same payment are a correction, and need a reason;
+        # only a pending payment clearing is taken as it comes.
+        fix = None
+        if earlier:
+            changed = [k for k, v in facts.items() if L.canonicalize(v) != L.canonicalize(earlier["payload"].get(k))]
+            if not changed:
+                return {"status": "unchanged", "record_id": earlier["payload"]["record_id"], "seal": earlier["seal"]}
+            clearing = changed == ["state"] and earlier["payload"].get("state") == "pending"
+            reason = (correction or {}).get("reason")
+            reason = reason.strip() if isinstance(reason, str) else ""
+            if not clearing and not reason:
+                return {"status": "conflict", "record_id": earlier["payload"]["record_id"], "sealed": False,
+                        "differs": [{"field": k, "sealed": earlier["payload"].get(k), "given": facts[k]} for k in changed],
+                        "how": "Nothing was sealed. If the sealed record is wrong, call again with correction={'reason': ...}. If this is another payment, give it its own source_id."}
+            if reason:
+                fix = {"reason": reason}
         version = earlier["payload"]["version"] + 1 if earlier else 1
         source_input = {k: v for k, v in {"rail": rail, "source_id": source_id, "amount_minor": amount_minor, "currency": currency, "occurred_at": occurred_at,
                         "counterparty": counterparty, "intent_id": intent_id, "memo": memo, "state": state, "nonce": nonce, "evidence": evidence,
@@ -266,6 +305,8 @@ class SprBook:
             "entity": self.entity, "entity_id": self.entity, "rail": rail, "reported_by": "agent",
             "source": {"id": src, "payload_sha256": L.hash_source_payload(source_input)},
             **facts,
+            **({"occurred_at_source": time_note} if time_note else {}),
+            **({"correction": fix} if fix else {}),
             "time_zone": self.time_zone, "settled_on": self._local_date(at),
             "agent": {"id": self.agent_id, "owner": self.owner},
             "rail_authorization": [{"scheme": f"{rail}_payment", "reference": nonce}] if nonce else [],
@@ -336,20 +377,69 @@ class SprBook:
                  "intent_id": (r["payload"].get("intent") or {}).get("intent_id"), "within_consent": (r["payload"].get("consent") or {}).get("within_consent"),
                  "payload_sha256": r["seal"]["payload_sha256"]} for r in (self.records if all else self._current())]
 
+    def public_key(self) -> dict:
+        """The book's public key: what finance registers with Luca once, so the book can be sent (send_to_luca)."""
+        return {"key_id": self.key_id, "public_pem": L.public_key_pem_of(self.key), "entity": self.entity, "agent_id": self.agent_id}
+
+    def package_files(self) -> dict:
+        """The book as a package (SPR section 8): each file by name, as text, with a sealed manifest of their hashes."""
+        names = [n for n in ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"] if os.path.exists(os.path.join(self.dir, n))]
+        files = {}
+        for n in names:
+            with open(os.path.join(self.dir, n), encoding="utf-8", newline="") as f:
+                files[n] = f.read()
+        pkg = {"schema": "luca.local-package/0.1", "entity": self.entity, "generated_at": _iso(self._now()), "producer": self.producer,
+               "format": L.SPEC_VERSION, "files": [{"name": n, "sha256": L.sha256_hex(files[n].encode("utf-8"))} for n in names]}
+        files["manifest.json"] = json.dumps({"package": pkg, "seal": L.seal_with(pkg, self.key)}, indent=2, ensure_ascii=False) + "\n"
+        return files
+
     def export_package(self, out_dir: str) -> dict:
         os.makedirs(out_dir, exist_ok=True)
-        names = [n for n in ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"] if os.path.exists(os.path.join(self.dir, n))]
-        for n in names:
-            shutil.copyfile(os.path.join(self.dir, n), os.path.join(out_dir, n))
-        def sha(n):
-            with open(os.path.join(out_dir, n), "rb") as f:
-                return L.sha256_hex(f.read())
-        pkg = {"schema": "luca.local-package/0.1", "entity": self.entity, "generated_at": _iso(self._now()), "producer": self.producer,
-               "format": L.SPEC_VERSION, "files": [{"name": n, "sha256": sha(n)} for n in names]}
-        with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
-            f.write(json.dumps({"package": pkg, "seal": L.seal_with(pkg, self.key)}, indent=2, ensure_ascii=False) + "\n")
+        files = self.package_files()
+        for n, text in files.items():
+            with open(os.path.join(out_dir, n), "w", encoding="utf-8", newline="") as f:
+                f.write(text)
         check = verify_folder(out_dir)
-        return {"folder": out_dir, "files": names + ["manifest.json"], "verified": check["ok"], "passed": check["passed"], "failed": check["failed"]}
+        return {"folder": out_dir, "files": list(files), "verified": check["ok"], "passed": check["passed"], "failed": check["failed"]}
+
+    # ---- Luca, the hosted service (optional) ----
+    def send_to_luca(self, url: Optional[str] = None, api_key: Optional[str] = None) -> dict:
+        """Sends the book to Luca, which checks every seal before it stores anything, then classifies each payment and
+        posts it to the company's ERP. The key must be registered first (register_with_luca). Sending it again changes nothing."""
+        return _luca_call(url, api_key, "/v1/spr/import", {"files": self.package_files()})
+
+    def register_with_luca(self, entity_id: str, url: Optional[str] = None, api_key: Optional[str] = None, agent_only: bool = False) -> dict:
+        """Asks Luca to accept this book's key for one of the company's entities. Needs a finance user's key; the
+        request waits until a second person approves it."""
+        body = {"public_pem": L.public_key_pem_of(self.key), "entity_id": entity_id, "book_entity": self.entity}
+        if agent_only:
+            body["agent_id"] = self.agent_id
+        return _luca_call(url, api_key, "/v1/spr/keys", body)
+
+
+class LucaError(Exception):
+    def __init__(self, status: int, message: str, detail: dict):
+        super().__init__(message)
+        self.status, self.detail = status, detail
+
+
+def _luca_call(url: Optional[str], api_key: Optional[str], path: str, body: dict) -> dict:
+    import urllib.error
+    import urllib.request
+    url, api_key = url or os.environ.get("LUCA_URL"), api_key or os.environ.get("LUCA_API_KEY")
+    if not url or not api_key:
+        raise ValueError("Give Luca's address and an API key (url, api_key), or set LUCA_URL and LUCA_API_KEY")
+    req = urllib.request.Request(url.rstrip("/") + path, data=json.dumps(body).encode("utf-8"), method="POST",
+                                 headers={"authorization": f"Bearer {api_key}", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            return json.loads(res.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode("utf-8") or "{}")
+        except ValueError:
+            detail = {}
+        raise LucaError(e.code, detail.get("error") or f"Luca answered {e.code}", detail) from None
 
 
 def verify_folder(folder: str) -> dict:

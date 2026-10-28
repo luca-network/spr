@@ -7,6 +7,9 @@ The SDK seals at the two moments that matter:
 - **Declare before paying:** what the agent is buying, why, and the most it may pay. This returns the intent's nonce. Signed as the payment's nonce, it makes the rail itself record which intent the payment was made under.
 - **Seal after paying:** the payment, matched to its intent, checked against the intent's window and cap.
 
+
+The book runs on your machine and makes no call to Luca. A check against the book's own `mandate.json` reports `authority: "self-declared"`, because whoever keeps the book writes it. Times need their offset (`2026-10-28T19:00:00Z`); a time without one is refused. The same payment again returns `unchanged`; different facts for a payment already sealed return `conflict` and seal nothing, unless you pass `correction: { reason }`.
+
 ## x402: one line
 
 ```js
@@ -51,6 +54,21 @@ The tools are `record_intent`, `check_payment`, `record_settlement`, `cancel_int
 - `book.label(recordId, { counterparty, product, tax })` seals your side of the label.
 - `book.counterpartySignature(labelId, jwk, signature)` records the other side's agreement.
 - `book.exportPackage(folder)` writes a package that anyone can check with `spr-verify` or the Python SDK.
+
+## Send the book to Luca (optional)
+
+The book works on its own. To have each payment classified, posted to your ERP and kept in Luca's hourly evidence, send it to Luca's hosted service. Luca checks every seal before it stores anything.
+
+```js
+// Once: a finance user asks Luca to accept the book's key, and a second person approves it in Luca.
+await book.registerWithLuca({ url: "https://sandbox.luca.network", apiKey: FINANCE_KEY, entityId: "acme-us" });
+
+// Then, whenever you like (each day, after each payment): sending the same book again changes nothing.
+const sent = await book.sendToLuca({ url: "https://sandbox.luca.network", apiKey: LUCA_API_KEY });
+sent.created; sent.versioned; sent.unchanged;
+```
+
+`url` and `apiKey` default to `LUCA_URL` and `LUCA_API_KEY`. Only the package's files are sent, never the private key.
 
 ## Keys
 

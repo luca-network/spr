@@ -1,15 +1,17 @@
 # Publishes the Python SDK (python/) to PyPI as spr-sdk, with PyPI Trusted Publishing: GitHub proves to PyPI
 # that this workflow, in this repository, is running, so no API token exists anywhere.
-# Run it by hand: Actions → publish-python → Run workflow. The "pypi" environment can require an approval.
+# Run it by hand: Actions → publish-python → Run workflow. The "pypi" environment asks for an approval.
 name: publish-python
 on:
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: pip install "cryptography>=42" build
       - name: Test before publishing
@@ -17,7 +19,9 @@ jobs:
         working-directory: python
       - run: python -m build
         working-directory: python
-      - uses: actions/upload-artifact@v4
+      - name: The test vectors are inside the wheel
+        run: python -m zipfile -l python/dist/*.whl | grep -q "spr/vectors.json"
+      - uses: actions/upload-artifact@v7
         with: { name: dist, path: python/dist/ }
   publish:
     needs: build
@@ -26,6 +30,6 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: dist, path: dist/ }
       - uses: pypa/gh-action-pypi-publish@release/v1
