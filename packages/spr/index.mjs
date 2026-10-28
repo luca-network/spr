@@ -1,0 +1,296 @@
+// SPR, the Sealed Payment Record (SPEC.md), as a library with no dependencies. Apache-2.0 (LICENSE).
+//
+// Everything a party needs to make or check a Luca record without Luca: canonical JSON, hashes, seals,
+// key IDs, Merkle roots and paths, the intent nonce, two-sided labels, the record and intent core
+// fields, and a check of a whole local package. Node's own crypto only; Node 20 or later.
+//
+// Luca's own service seals with this library, so do the SPR SDKs, and the test vectors in
+// vectors/vectors.json are produced and checked with it. Another implementation conforms when it gives
+// the same answers on those vectors.
+import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
+
+export const SPEC_VERSION = "spr/draft-1";
+
+// ---- 1. canonical JSON ---------------------------------------------------------------------------------
+// RFC 8785 (JCS) for the value types Luca signs: strings, integers, booleans, null, arrays and objects.
+// Object members are sorted by UTF-16 code unit; members whose value is undefined are left out. Numbers
+// must be safe integers: money is always integer minor units, so a float is an error, never rounded.
+export function canonicalize(value) {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "string":
+      return JSON.stringify(value);
+    case "boolean":
+      return value ? "true" : "false";
+    case "number":
+      if (!Number.isSafeInteger(value)) throw new Error(`canonicalize: only safe integers can be signed, got ${value}`);
+      return String(value);
+    case "object": {
+      if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
+      const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+      return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(",")}}`;
+    }
+    default:
+      throw new Error(`canonicalize: unsupported type ${typeof value}`);
+  }
+}
+
+// ---- 2. hashes -------------------------------------------------------------------------------------------
+// SHA-256, lower-case hex. Text is hashed as UTF-8.
+export function sha256Hex(data) {
+  return createHash("sha256").update(typeof data === "string" ? Buffer.from(data, "utf8") : data).digest("hex");
+}
+export const payloadSha256 = (payload) => sha256Hex(canonicalize(payload));
+
+// A rail's own payload may hold floats, so it is hashed from sorted-key JSON that keeps numbers as JSON
+// writes them. The hash ties a record to what the rail sent; it is not a seal.
+export function hashSourcePayload(value) {
+  const sortKeys = (v) => Array.isArray(v) ? v.map(sortKeys)
+    : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])])) : v;
+  return sha256Hex(JSON.stringify(sortKeys(value)));
+}
+
+// ---- 3. keys and seals -----------------------------------------------------------------------------------
+const asPublic = (key) => typeof key === "string" ? createPublicKey(key) : key.type === "private" ? createPublicKey(key) : key;
+const asPrivate = (key) => typeof key === "string" ? createPrivateKey(key) : key;
+
+// A key's ID: "ed25519:" and the first 16 hex characters of the SHA-256 of the base64 text of its
+// SubjectPublicKeyInfo (DER).
+export function keyIdFor(key) {
+  const der = asPublic(key).export({ type: "spki", format: "der" });
+  return "ed25519:" + sha256Hex(der.toString("base64")).slice(0, 16);
+}
+export const publicKeyPemOf = (key) => asPublic(key).export({ type: "spki", format: "pem" }).toString();
+
+// Two seal algorithms. "ed25519" signs the canonical JSON itself. "ed25519-digest" signs the fixed text
+// "luca.seal/1:" followed by the payload's SHA-256, for keys held in a hardware module that signs at most
+// a few kilobytes; it binds the same content.
+export const SEAL_DIGEST_PREFIX = "luca.seal/1:";
+export const digestMessage = (hash) => Buffer.from(`${SEAL_DIGEST_PREFIX}${hash}`, "utf8");
+export const SEAL_ALGORITHMS = ["ed25519", "ed25519-digest"];
+
+export function sealWith(payload, privateKey, options = {}) {
+  const algorithm = options.algorithm ?? "ed25519";
+  if (!SEAL_ALGORITHMS.includes(algorithm)) throw new Error(`unknown seal algorithm ${algorithm}`);
+  const priv = asPrivate(privateKey);
+  if (priv.asymmetricKeyType !== "ed25519") throw new Error(`a seal key must be Ed25519, got ${priv.asymmetricKeyType}`);
+  const canonical = canonicalize(payload);
+  const hash = sha256Hex(canonical);
+  const message = algorithm === "ed25519-digest" ? digestMessage(hash) : Buffer.from(canonical, "utf8");
+  return { payload_sha256: hash, signature: sign(null, message, priv).toString("base64"), key_id: options.keyId ?? keyIdFor(priv), algorithm };
+}
+
+// A seal may be written with snake_case names (the format) or camelCase (as some services keep it).
+export function normalizeSeal(seal) {
+  return {
+    payload_sha256: seal.payload_sha256 ?? seal.payloadHash ?? seal.payload_hash,
+    signature: seal.signature,
+    key_id: seal.key_id ?? seal.keyId,
+    algorithm: seal.algorithm ?? "ed25519",
+  };
+}
+
+// Checks a seal with a public key. key_matches is false when that key is not the one the seal names.
+// `algorithm` overrides the seal's own, for a reader that registered the key with its algorithm.
+export function verifySeal(payload, seal, publicKey, algorithm) {
+  const s = normalizeSeal(seal);
+  let canonical;
+  try { canonical = canonicalize(payload); } catch { return { ok: false, hash_matches: false, signature_valid: false, key_matches: false }; }
+  const hash_matches = sha256Hex(canonical) === s.payload_sha256;
+  let pub = null;
+  try { pub = publicKey ? asPublic(publicKey) : null; } catch { pub = null; }
+  let key_matches = false;
+  try { key_matches = Boolean(pub) && (!s.key_id || keyIdFor(pub) === s.key_id); } catch { key_matches = false; }
+  const alg = algorithm ?? s.algorithm;
+  let signature_valid = false;
+  try {
+    if (pub) signature_valid = verify(null, alg === "ed25519-digest" ? digestMessage(s.payload_sha256) : Buffer.from(canonical, "utf8"), pub, Buffer.from(s.signature, "base64"));
+  } catch { signature_valid = false; }
+  return { ok: hash_matches && signature_valid && key_matches, hash_matches, signature_valid, key_matches };
+}
+
+// ---- 4. Merkle trees -------------------------------------------------------------------------------------
+// Leaves are SHA-256 hashes in hex. A parent is the SHA-256 of the two children's bytes (left then right).
+// An odd node at the end of a level is carried up unchanged. The root of no leaves is the SHA-256 of "".
+const pair = (l, r) => sha256Hex(Buffer.from(l + r, "hex"));
+export function merkleRoot(leaves) {
+  if (!leaves.length) return sha256Hex("");
+  let level = leaves.slice();
+  while (level.length > 1) {
+    const next = [];
+    for (let i = 0; i < level.length; i += 2) next.push(i + 1 < level.length ? pair(level[i], level[i + 1]) : level[i]);
+    level = next;
+  }
+  return level[0];
+}
+// The path from leaf `index` to the root: each step names the sibling and the side it sits on.
+export function merklePath(leaves, index) {
+  const path = [];
+  let level = leaves.slice(), i = index;
+  while (level.length > 1) {
+    const j = i % 2 === 0 ? i + 1 : i - 1;
+    if (j < level.length) path.push({ sibling: level[j], side: i % 2 === 0 ? "right" : "left" });
+    const next = [];
+    for (let k = 0; k < level.length; k += 2) next.push(k + 1 < level.length ? pair(level[k], level[k + 1]) : level[k]);
+    level = next; i = Math.floor(i / 2);
+  }
+  return path;
+}
+export const rootFromPath = (leaf, path) => path.reduce((h, p) => p.side === "right" ? pair(h, p.sibling) : pair(p.sibling, h), leaf);
+
+// A journal entry's commitment to its records: the Merkle root over their payload hashes, records in
+// order of ID.
+export function recordsRoot(records) {
+  return merkleRoot([...records].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map((r) => r.payload_sha256));
+}
+
+// ---- 5. the intent nonce ---------------------------------------------------------------------------------
+// The value a payer signs as the payer-chosen nonce of a rail's transfer authorization (EIP-3009 and the
+// like), which binds the payment to the sealed intent: SHA-256 of "luca.intent-nonce/1:", the intent's
+// payload hash in hex, ":" and a sequence number (0 for one payment; 1, 2… where an intent covers several).
+export const INTENT_NONCE_SCHEME = "luca.intent-nonce/1";
+export function intentNonce(intentPayloadSha256, seq = 0) {
+  if (!/^[0-9a-f]{64}$/i.test(intentPayloadSha256)) throw new Error("intent payload hash must be 64 hex characters");
+  if (!Number.isInteger(seq) || seq < 0) throw new Error("seq must be a whole number");
+  return `0x${sha256Hex(`${INTENT_NONCE_SCHEME}:${intentPayloadSha256.toLowerCase()}:${seq}`)}`;
+}
+
+// ---- 6. two-sided labels ---------------------------------------------------------------------------------
+export const LABEL_SCHEMA = "luca.label/1";
+export const labelSharedSha256 = (shared) => payloadSha256(shared);
+// What each side signs: the canonical JSON of {schema, label_id, shared_sha256}, as UTF-8.
+export const labelSigningInput = (labelId, sharedSha256) => canonicalize({ schema: LABEL_SCHEMA, label_id: labelId, shared_sha256: sharedSha256 });
+
+// RFC 7638 thumbprint of an Ed25519 (OKP) or P-256 (EC) public JWK, base64url.
+export function jwkThumbprint(jwk) {
+  const members = jwk.kty === "OKP" ? { crv: jwk.crv, kty: jwk.kty, x: jwk.x } : { crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y };
+  return createHash("sha256").update(JSON.stringify(members)).digest("base64url");
+}
+// A counterparty's public key: Ed25519 or P-256, never a private key. Returns the key reduced to its
+// public members.
+export function checkPublicJwk(jwk) {
+  if (!jwk || typeof jwk !== "object") throw new Error("a public JWK is required");
+  if ("d" in jwk || "p" in jwk) throw new Error("the JWK holds a private key; only the public key is accepted");
+  const ok = (jwk.kty === "OKP" && jwk.crv === "Ed25519" && jwk.x) || (jwk.kty === "EC" && jwk.crv === "P-256" && jwk.x && jwk.y);
+  if (!ok) throw new Error("the JWK must be an Ed25519 (kty OKP) or P-256 (kty EC) public key");
+  createPublicKey({ key: jwk, format: "jwk" });
+  return jwk.kty === "OKP" ? { kty: "OKP", crv: "Ed25519", x: jwk.x } : { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y };
+}
+// Signs a label: Ed25519 (EdDSA), or P-256 (ES256, signature as r||s). base64url.
+export function signLabel(privateKey, labelId, sharedSha256) {
+  const priv = asPrivate(privateKey);
+  const msg = Buffer.from(labelSigningInput(labelId, sharedSha256), "utf8");
+  const sig = priv.asymmetricKeyType === "ed25519" ? sign(null, msg, priv) : sign("sha256", msg, { key: priv, dsaEncoding: "ieee-p1363" });
+  return sig.toString("base64url");
+}
+export function verifyLabelSignature(jwk, labelId, sharedSha256, signature) {
+  if (typeof signature !== "string" || !signature) return false;
+  const msg = Buffer.from(labelSigningInput(labelId, sharedSha256), "utf8");
+  const sig = Buffer.from(signature.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+  try {
+    const key = createPublicKey({ key: jwk, format: "jwk" });
+    return jwk.kty === "OKP" ? verify(null, msg, key, sig) : verify("sha256", msg, { key, dsaEncoding: "ieee-p1363" }, sig);
+  } catch { return false; }
+}
+
+// ---- 8. core fields of records and intents ---------------------------------------------------------------
+// The fields every record carries, whoever made it. A producer may add any other member; a reader keeps
+// what it does not understand, since the seal covers it.
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+const isStr = (v) => typeof v === "string" && v.length > 0;
+const isInt = (v) => Number.isSafeInteger(v);
+
+export const RECORD_SCHEMA_PATTERN = /^luca\.record\/\d+\.\d+$/;
+export function checkRecord(p) {
+  const problems = [];
+  const need = (ok, what) => { if (!ok) problems.push(what); };
+  if (!p || typeof p !== "object") return { ok: false, problems: ["a record payload is an object"] };
+  need(typeof p.schema === "string" && RECORD_SCHEMA_PATTERN.test(p.schema), "schema is luca.record/<major>.<minor>");
+  need(isStr(p.record_id), "record_id is a non-empty string");
+  need(isInt(p.version) && p.version >= 1, "version is an integer from 1");
+  need(p.supersedes === null || isStr(p.supersedes), "supersedes is the record_id of the version replaced, or null");
+  need((p.version === 1) === (p.supersedes === null), "version 1 supersedes nothing; a later version names the one it replaces");
+  need(isStr(p.entity), "entity names the company whose record this is");
+  need(isStr(p.rail), "rail names the payment rail");
+  need(["inflow", "outflow"].includes(p.direction), "direction is inflow or outflow");
+  need(p.source && isStr(p.source.id), "source.id is the rail's own reference for the payment");
+  need(isStr(p.state), "state is given");
+  need(isInt(p.amount_minor), "amount_minor is an integer in the currency's minor unit");
+  need(isStr(p.currency), "currency is given");
+  need(p.occurred_at === null || (typeof p.occurred_at === "string" && INSTANT.test(p.occurred_at)), "occurred_at is an ISO 8601 instant with its offset, or null");
+  need(p.settled_on === null || p.settled_on === undefined || (typeof p.settled_on === "string" && DATE.test(p.settled_on)), "settled_on is a date (YYYY-MM-DD), or null");
+  if (p.intent) need(isStr(p.intent.intent_id), "intent.intent_id names the intent the payment was made under");
+  return { ok: problems.length === 0, problems };
+}
+
+export const INTENT_SCHEMA_PATTERN = /^luca\.intent\/\d+\.\d+$/;
+export function checkIntent(p) {
+  const problems = [];
+  const need = (ok, what) => { if (!ok) problems.push(what); };
+  if (!p || typeof p !== "object") return { ok: false, problems: ["an intent payload is an object"] };
+  need(typeof p.schema === "string" && INTENT_SCHEMA_PATTERN.test(p.schema), "schema is luca.intent/<major>.<minor>");
+  need(isStr(p.intent_id), "intent_id is a non-empty string");
+  need(isStr(p.purpose), "purpose says, in a sentence, why the payment is made");
+  need(typeof p.declared_at === "string" && INSTANT.test(p.declared_at), "declared_at is an ISO 8601 instant");
+  need(typeof p.expires_at === "string" && INSTANT.test(p.expires_at), "expires_at is an ISO 8601 instant");
+  need(p.max_amount_minor === null || p.max_amount_minor === undefined || (isInt(p.max_amount_minor) && p.max_amount_minor > 0), "max_amount_minor is a positive integer, or null");
+  need(p.currency === null || p.currency === undefined || isStr(p.currency), "currency is given, or null");
+  return { ok: problems.length === 0, problems };
+}
+
+// ---- 9. a local package ----------------------------------------------------------------------------------
+// A folder (or a map of file name to bytes) holding keys.jsonl, intents.jsonl, records.jsonl and a sealed
+// manifest.json, as the MCP server's local mode writes it. Returns every check made, and ok when all pass.
+export function verifyPackage(read) {
+  const results = [];
+  const check = (what, ok, detail = "") => { results.push({ what, ok: Boolean(ok), detail }); return ok; };
+  const jsonl = (name) => { const b = read(name); return b ? b.toString("utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l)) : []; };
+  const keys = new Map(jsonl("keys.jsonl").map((k) => [k.key_id, k]));
+  const sealOk = (payload, seal) => {
+    const s = normalizeSeal(seal ?? {});
+    const k = keys.get(s.key_id);
+    if (!k) return { ok: false, detail: `key ${s.key_id} is not in keys.jsonl` };
+    const v = verifySeal(payload, s, k.public_pem, k.algorithm ?? s.algorithm);
+    return { ok: v.ok, detail: v.ok ? "" : !v.hash_matches ? "the payload's hash is not the sealed hash" : "the signature does not verify with that key" };
+  };
+  const manifestBytes = read("manifest.json");
+  if (check("manifest.json is present", Boolean(manifestBytes))) {
+    const m = JSON.parse(manifestBytes.toString("utf8"));
+    const s = sealOk(m.package, m.seal);
+    check("the manifest is sealed", s.ok, s.detail);
+    for (const f of m.package?.files ?? []) {
+      const b = read(f.name);
+      check(`${f.name} is the file the manifest names`, Boolean(b) && sha256Hex(b) === f.sha256, b ? "its SHA-256 differs" : "missing");
+    }
+  }
+  const intents = jsonl("intents.jsonl"), records = jsonl("records.jsonl");
+  const intentById = new Map();
+  for (const i of intents) {
+    const s = sealOk(i.payload, i.seal);
+    check(`intent ${i.payload?.intent_id} is sealed`, s.ok, s.detail);
+    const c = checkIntent(i.payload);
+    check(`intent ${i.payload?.intent_id} has the core fields`, c.ok, c.problems.join("; "));
+    intentById.set(i.payload?.intent_id, i);
+  }
+  const recById = new Map(records.map((r) => [r.payload?.record_id, r]));
+  for (const r of records) {
+    const p = r.payload ?? {};
+    const s = sealOk(p, r.seal);
+    check(`record ${p.record_id} is sealed`, s.ok, s.detail);
+    const c = checkRecord(p);
+    check(`record ${p.record_id} has the core fields`, c.ok, c.problems.join("; "));
+    if (p.supersedes) check(`record ${p.record_id} replaces a version in the package`, recById.has(p.supersedes), p.supersedes);
+    if (p.intent?.intent_id) {
+      const i = intentById.get(p.intent.intent_id);
+      check(`record ${p.record_id}: its intent is in the package`, Boolean(i), p.intent.intent_id);
+      if (i) check(`record ${p.record_id}: it names the intent's sealed hash`, normalizeSeal(i.seal).payload_sha256 === p.intent.payload_sha256);
+      const b = p.consent?.binding;
+      if (i && b?.nonce) {
+        const expected = intentNonce(normalizeSeal(i.seal).payload_sha256, Number.isInteger(b.seq) ? b.seq : 0);
+        check(`record ${p.record_id}: bound only when the nonce is the intent's fingerprint`, (b.status === "bound") === (b.nonce.toLowerCase() === expected), `expected ${expected}`);
+      }
+    }
+  }
+  return { ok: results.every((r) => r.ok), passed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
+}

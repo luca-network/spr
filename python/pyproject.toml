@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spr-sdk"
+version = "0.1.0"
+description = "SPR, the Sealed Payment Record: seal AI agent payments locally with your company's own key, and check them without Luca"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Luca Africa Inc." }]
+requires-python = ">=3.10"
+dependencies = ["cryptography>=42"]
+
+[tool.setuptools]
+packages = ["spr"]

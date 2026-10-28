@@ -1,0 +1,17 @@
+{
+  "name": "@luca-network/spr-mcp",
+  "version": "0.1.0",
+  "description": "SPR as an MCP server: AI agents declare, check and seal each payment, with your company's own key, on your own machine",
+  "license": "Apache-2.0",
+  "author": "Luca Africa Inc. <hello@luca.network>",
+  "homepage": "https://github.com/luca-network/spr",
+  "repository": { "type": "git", "url": "git+https://github.com/luca-network/spr.git", "directory": "packages/spr-mcp" },
+  "keywords": ["mcp", "model-context-protocol", "ai-agents", "payments", "x402", "accounting"],
+  "type": "module",
+  "exports": { ".": { "types": "./server.d.mts", "default": "./server.mjs" } },
+  "bin": { "spr-mcp": "bin/spr-mcp.mjs" },
+  "files": ["server.mjs", "server.d.mts", "bin", "README.md", "LICENSE", "NOTICE"],
+  "engines": { "node": ">=20" },
+  "dependencies": { "@luca-network/spr-sdk": "0.1.0", "@modelcontextprotocol/sdk": "1.32.1" },
+  "publishConfig": { "access": "public" }
+}

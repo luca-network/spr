@@ -1,0 +1,107 @@
+// Writes vectors.json. Run when the format changes: node lib/spr/vectors/generate.mjs
+// The Ed25519 key is RFC 8032's published test key 1 (section 7.1), so anyone can reproduce every
+// signature. The P-256 label signature is made with a key thrown away after the run; only its public key
+// and the signature are kept, since ES256 signatures are not deterministic.
+import { writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createPublicKey, generateKeyPairSync } from "node:crypto";
+import * as L from "../index.mjs";
+import { ed25519FromSeed } from "./run.mjs";
+
+const SEED = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+const PUB = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+const priv = ed25519FromSeed(SEED);
+const pubJwk = createPublicKey(priv).export({ format: "jwk" });
+const h = (s) => L.sha256Hex(s);
+
+const canonical = [
+  ["empty object", {}],
+  ["keys sorted, undefined dropped", { b: 1, a: [true, null, "x"], c: undefined }],
+  ["nested objects and arrays keep array order", { z: [{ y: 2, x: 1 }, [3, 2, 1]], a: { d: { c: null } } }],
+  ["negative and large safe integers", { minus: -4050, big: 9007199254740991, zero: 0 }],
+  ["keys sorted by UTF-16 code unit (digits, upper case, lower case, then é)", { "é": 1, z: 2, Z: 3, "10": 4, "9": 5 }],
+  // Sorting by code point (Python's default) puts U+E000 and U+FFFF before the emoji; UTF-16 order puts the emoji first.
+  ["keys outside the basic plane sort by UTF-16 code unit (emoji, a surrogate pair, before U+E000 and U+FFFF)", { "\uffff": 1, "😀": 2, a: 3, "\ue000": 4 }],
+  ["string escapes", { s: "quote \" backslash \\ tab \t newline \n control \u0001 line sep   emoji 😀" }],
+  ["a record-shaped payload", { schema: "luca.record/0.7", record_id: "LR-X402-0123456789-v1", version: 1, supersedes: null, amount_minor: 1500000, currency: "USDC" }],
+].map(([name, input]) => ({ name, input, canonical: L.canonicalize(input), sha256: h(L.canonicalize(input)) }));
+
+const canonical_rejects = [
+  { name: "a float", input_json: "{\"amount\":12.5}" },
+  { name: "an integer beyond 2^53 - 1", input_json: "{\"amount\":9007199254740993}" },
+];
+
+const recordPayload = {
+  schema: "luca.record/0.7", record_id: "LR-X402-AB12CD34EF-v1", version: 1, supersedes: null,
+  entity: "Example Co", entity_id: "example-co", rail: "x402", direction: "outflow", reported_by: "agent",
+  source: { id: "0x5f2c0000000000000000000000000000000000000000000000000000000000aa" },
+  state: "cleared", amount_minor: 250000, currency: "USDC",
+  occurred_at: "2026-10-21T17:04:05Z", time_zone: "UTC", settled_on: "2026-10-21", counterparty: "data.example",
+};
+const seals = ["ed25519", "ed25519-digest"].map((algorithm) => ({
+  name: `${algorithm} over a record`, key: "rfc8032_test1", algorithm, payload: recordPayload,
+  seal: L.sealWith(recordPayload, priv, { algorithm }), tampered: { ...recordPayload, amount_minor: 250001 },
+}));
+
+const leaves = ["a", "b", "c", "d", "e"].map((x) => h(x));
+const merkle = [
+  { name: "no leaves", leaves: [] },
+  { name: "one leaf", leaves: leaves.slice(0, 1) },
+  { name: "two leaves", leaves: leaves.slice(0, 2) },
+  { name: "five leaves (an odd node carried up)", leaves },
+].map((m) => ({ ...m, root: L.merkleRoot(m.leaves), paths: m.leaves.map((_, i) => ({ index: i, path: L.merklePath(m.leaves, i) })) }));
+
+const recs = [{ id: "LR-B-v1", payload_sha256: h("b") }, { id: "LR-A-v1", payload_sha256: h("a") }, { id: "LR-C-v2", payload_sha256: h("c") }];
+const records_root = [{ name: "three records, given out of order", records: recs, root: L.recordsRoot(recs) }];
+
+const intentHash = L.payloadSha256({ schema: "luca.intent/0.1", intent_id: "int_00000000000000000001", purpose: "Market data for the pricing model" });
+const intent_nonce = [0, 1, 7].map((seq) => ({ name: `sequence ${seq}`, intent_payload_sha256: intentHash, seq, nonce: L.intentNonce(intentHash, seq) }));
+
+const p256 = generateKeyPairSync("ec", { namedCurve: "P-256" });
+const p256Jwk = p256.publicKey.export({ format: "jwk" });
+const shared = {
+  schema: "luca.label/1", label_id: "lbl_0123456789abcdef0123",
+  payment: { rail: "x402", id: recordPayload.source.id, network: "eip155:8453" },
+  amount_minor: 250000, currency: "USDC", accounting_date: "2026-10-21", payer: "Example Co", payee: "Data Example Ltd",
+  product: { code: "data_access", label: "Data access" }, tax: { jurisdiction: "US-CA", treatment: "exempt" },
+};
+const sharedSha = L.labelSharedSha256(shared);
+const labels = [{
+  name: "an x402 purchase of data", label_id: shared.label_id, shared, shared_sha256: sharedSha,
+  signing_input: L.labelSigningInput(shared.label_id, sharedSha),
+  signatures: [
+    { alg: "EdDSA", key: "rfc8032_test1", jwk: { kty: "OKP", crv: "Ed25519", x: pubJwk.x }, signature: L.signLabel(priv, shared.label_id, sharedSha) },
+    { alg: "ES256", jwk: { kty: "EC", crv: "P-256", x: p256Jwk.x, y: p256Jwk.y }, signature: L.signLabel(p256.privateKey, shared.label_id, sharedSha) },
+  ],
+}];
+const jwk_thumbprints = [
+  { name: "Ed25519", jwk: { kty: "OKP", crv: "Ed25519", x: pubJwk.x } },
+  { name: "P-256", jwk: { kty: "EC", crv: "P-256", x: p256Jwk.x, y: p256Jwk.y } },
+].map((t) => ({ ...t, thumbprint: L.jwkThumbprint(t.jwk) }));
+
+const records = [
+  { name: "a complete record", payload: recordPayload, ok: true },
+  { name: "a correction names the version it replaces", payload: { ...recordPayload, record_id: "LR-X402-AB12CD34EF-v2", version: 2, supersedes: "LR-X402-AB12CD34EF-v1" }, ok: true },
+  { name: "version 2 with nothing replaced", payload: { ...recordPayload, version: 2 }, ok: false },
+  { name: "an amount in decimal units", payload: { ...recordPayload, amount_minor: "2.50" }, ok: false },
+  { name: "a local time with no offset", payload: { ...recordPayload, occurred_at: "2026-10-21T17:04:05" }, ok: false },
+  { name: "no direction", payload: { ...recordPayload, direction: undefined }, ok: false },
+];
+const intentPayload = { schema: "luca.intent/0.1", intent_id: "int_00000000000000000001", purpose: "Market data for the pricing model",
+  max_amount_minor: 300000, currency: "USDC", declared_at: "2026-10-21T17:00:00Z", expires_at: "2026-10-24T17:00:00Z" };
+const intents = [
+  { name: "a complete intent", payload: intentPayload, ok: true },
+  { name: "no purpose", payload: { ...intentPayload, purpose: "" }, ok: false },
+  { name: "a cap of zero", payload: { ...intentPayload, max_amount_minor: 0 }, ok: false },
+];
+
+const out = {
+  spec: L.SPEC_VERSION,
+  note: "Generated by vectors/generate.mjs. Key rfc8032_test1 is the published test key 1 of RFC 8032, section 7.1: a test key, never used for real records.",
+  keys: { rfc8032_test1: { seed_hex: SEED, public_hex: PUB, key_id: L.keyIdFor(priv), public_pem: L.publicKeyPemOf(priv) } },
+  canonical, canonical_rejects, seals, merkle, records_root, intent_nonce, jwk_thumbprints, labels,
+  records, intents,
+};
+writeFileSync(join(dirname(fileURLToPath(import.meta.url)), "vectors.json"), JSON.stringify(out, null, 2) + "\n");
+console.log("vectors.json written");
