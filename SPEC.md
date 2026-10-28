@@ -58,7 +58,7 @@ The public keys of a company are published as a list of `{ key_id, algorithm, pu
 
 ## 4. Merkle trees
 
-The format uses one Merkle tree construction for hourly evidence, for a journal entry's commitment to its records and for packages.
+The format uses one Merkle tree construction for evidence, for a journal entry's commitment to its records and for packages.
 
 - Leaves are payload hashes, in hexadecimal.
 - A parent is the SHA-256 of the bytes of the left child followed by the bytes of the right child.
@@ -183,7 +183,7 @@ A checker of a package MUST check:
 
 A book's own folder also holds its private key (`key.pem` in the SDKs) and no manifest. A checker MAY check it as a book (every seal and core field, with no manifest) and SHOULD say to share an export instead. A package MUST NOT contain a private key, and a checker MUST fail one that does.
 
-Luca's monthly audit package (`luca.audit-package/1`, checked by `verifier/luca-verify.mjs`) is a larger package of the same kind. It adds journal entries with their records roots, sealed rail-read windows, hourly evidence with outside timestamps, and the company's sealed completeness statement.
+Luca's monthly audit package (`luca.audit-package/1`) is a larger package of the same kind, with its own checker.
 
 ## 9. Conformance
 

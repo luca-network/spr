@@ -31,7 +31,7 @@ python -m spr --vectors
 Send the book to Luca's hosted service (optional), which checks every seal, then classifies each payment and posts it to your ERP:
 
 ```python
-book.register_with_luca("acme-us", url="https://sandbox.luca.network", api_key=FINANCE_KEY)   # once; a second person approves it in Luca
+book.register_with_luca("acme-us", url="https://sandbox.luca.network", api_key=FINANCE_KEY)   # once, by finance
 book.send_to_luca(url="https://sandbox.luca.network", api_key=LUCA_API_KEY)                    # sending it again changes nothing
 ```
 

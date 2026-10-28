@@ -351,14 +351,13 @@ export class SprBook {
   }
 
   // ---- Luca, the hosted service (optional) ----
-  // Sends the book to Luca, which checks every seal before it stores anything, then classifies each payment, posts
-  // it to the company's ERP and keeps it in the hourly evidence. The book's key must be registered first
-  // (registerWithLuca, approved by a second person in finance). Sending the same book again changes nothing.
+  // Sends the book to Luca's hosted service, which checks every seal before it stores anything. The book's key is
+  // registered with Luca first (registerWithLuca). Sending the same book again changes nothing.
   async sendToLuca(opts = {}) {
     return lucaCall(opts, "/v1/spr/import", { files: this.packageFiles() });
   }
-  // Asks Luca to accept this book's key for one of the company's entities. Needs a finance user's key; the
-  // request waits until a second person approves it. agentOnly limits the key to this book's agent.
+  // Asks Luca to accept this book's key for one of the company's entities, with a finance user's key.
+  // agentOnly limits the key to this book's agent.
   async registerWithLuca(opts = {}) {
     const k = this.publicKey();
     return lucaCall(opts, "/v1/spr/keys", { public_pem: k.public_pem, entity_id: opts.entityId, book_entity: this.cfg.entity,

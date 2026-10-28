@@ -57,10 +57,10 @@ The tools are `record_intent`, `check_payment`, `record_settlement`, `cancel_int
 
 ## Send the book to Luca (optional)
 
-The book works on its own. To have each payment classified, posted to your ERP and kept in Luca's hourly evidence, send it to Luca's hosted service. Luca checks every seal before it stores anything.
+The book works on its own. To have each payment kept as accounting (confirmed from the rail, classified to your accounts, posted to your ERP), send it to Luca's hosted service. Luca checks every seal before it stores anything.
 
 ```js
-// Once: a finance user asks Luca to accept the book's key, and a second person approves it in Luca.
+// Once: finance registers the book's key with Luca.
 await book.registerWithLuca({ url: "https://sandbox.luca.network", apiKey: FINANCE_KEY, entityId: "acme-us" });
 
 // Then, whenever you like (each day, after each payment): sending the same book again changes nothing.

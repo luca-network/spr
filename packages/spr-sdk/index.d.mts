@@ -58,7 +58,7 @@ export declare class SprBook {
   packageFiles(): Record<string, string>;
   /** Sends the book to Luca, which checks every seal before storing anything. url and apiKey default to LUCA_URL and LUCA_API_KEY. */
   sendToLuca(opts?: LucaOptions): Promise<LucaImport>;
-  /** Asks Luca to accept this book's key for an entity; needs a finance user's key and a second person's approval. */
+  /** Asks Luca to accept this book's key for an entity, with a finance user's key. */
   registerWithLuca(opts: LucaOptions & { entityId: string; agentOnly?: boolean }): Promise<{ change: { id: string; status: string } }>;
 }
 export interface LucaOptions { url?: string; apiKey?: string; fetch?: typeof fetch }

@@ -404,13 +404,12 @@ class SprBook:
 
     # ---- Luca, the hosted service (optional) ----
     def send_to_luca(self, url: Optional[str] = None, api_key: Optional[str] = None) -> dict:
-        """Sends the book to Luca, which checks every seal before it stores anything, then classifies each payment and
-        posts it to the company's ERP. The key must be registered first (register_with_luca). Sending it again changes nothing."""
+        """Sends the book to Luca's hosted service, which checks every seal before it stores anything. The key is
+        registered with Luca first (register_with_luca). Sending it again changes nothing."""
         return _luca_call(url, api_key, "/v1/spr/import", {"files": self.package_files()})
 
     def register_with_luca(self, entity_id: str, url: Optional[str] = None, api_key: Optional[str] = None, agent_only: bool = False) -> dict:
-        """Asks Luca to accept this book's key for one of the company's entities. Needs a finance user's key; the
-        request waits until a second person approves it."""
+        """Asks Luca to accept this book's key for one of the company's entities, with a finance user's key."""
         body = {"public_pem": L.public_key_pem_of(self.key), "entity_id": entity_id, "book_entity": self.entity}
         if agent_only:
             body["agent_id"] = self.agent_id

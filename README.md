@@ -52,17 +52,17 @@ The packages here run on your own machine and make no call to Luca. Luca's hoste
 |---|---|---|
 | Where it runs | Your machine, your folder, your key | Luca's service |
 | What it records | The intent before paying and the payment after, as the agent reports them | The same, plus the payment as the rail itself reports it |
-| Limits it checks | The intent's cap and expiry, and the book's own `mandate.json`, which whoever keeps the book writes (`authority: "self-declared"`) | Mandates finance approves in Luca, checked before and after each payment |
+| Limits it checks | The intent's cap and expiry, and the book's own `mandate.json`, which whoever keeps the book writes (`authority: "self-declared"`) | Mandates your finance team approves in Luca |
 | Confirmation from the rail | None: the record is what the agent reported | The payment read from the rail, and any difference flagged |
 | Accounting | None | Classification to your accounts (US GAAP, IFRS, tax), journal entries posted to your ERP, the month's close |
-| Evidence | Seals anyone can check with `spr-verify` or `python -m spr` | Hourly evidence with outside timestamps, and the audit package |
+| Evidence | Seals anyone can check with `spr-verify` or `python -m spr` | Evidence your auditor can check, and the month's audit package |
 | Cost | Free, Apache-2.0 | A Luca account |
 
 A book moves across with one call once finance has registered its key: `book.sendToLuca()`. Luca checks every seal before it stores anything.
 
 ## Send the book to Luca (optional)
 
-A finance user registers the book's key once (`book.registerWithLuca`), a second person approves it, and then `book.sendToLuca()` sends the book. Luca checks every seal before it stores anything, and sending the same book again changes nothing. Write to hello@luca.network for an account.
+Finance registers the book's key with Luca once (`book.registerWithLuca`), and then `book.sendToLuca()` sends the book. Luca checks every seal before it stores anything, and sending the same book again changes nothing. Write to hello@luca.network for an account.
 
 ## Status
 
