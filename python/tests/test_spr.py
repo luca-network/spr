@@ -80,6 +80,11 @@ class SendToLuca(unittest.TestCase):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["content-length"])))
                 seen.append((self.path, self.headers["authorization"], body))
+                if self.headers["authorization"] == "Bearer moved":
+                    self.send_response(302)
+                    self.send_header("location", "http://elsewhere.example/v1/spr/import")
+                    self.end_headers()
+                    return
                 refused = self.headers["authorization"] == "Bearer bad"
                 out = json.dumps({"error": "Key is not registered with Luca"} if refused else {"import_id": "spi_1", "created": 1}).encode()
                 self.send_response(403 if refused else 201)
@@ -97,6 +102,14 @@ class SendToLuca(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 book = SprBook(dir=d, agent_id="agt_research", entity="Example Co")
                 book.seal(rail="stripe", source_id="pi_1", amount_minor=4900, currency="USD")
+                # Plain HTTP is refused, even to this computer, unless local development is asked for.
+                with self.assertRaises(ValueError):
+                    book.send_to_luca(url=url, api_key="k_1")
+                with self.assertRaises(ValueError):
+                    book.send_to_luca(url="http://luca.example", api_key="k_1")
+                self.assertEqual(seen, [])
+                os.environ["LUCA_ALLOW_INSECURE_LOCAL"] = "1"
+                self.addCleanup(os.environ.pop, "LUCA_ALLOW_INSECURE_LOCAL", None)
                 self.assertEqual(book.send_to_luca(url=url, api_key="k_1")["created"], 1)
                 path, auth, body = seen[0]
                 self.assertEqual((path, auth), ("/v1/spr/import", "Bearer k_1"))
@@ -109,6 +122,9 @@ class SendToLuca(unittest.TestCase):
                 with self.assertRaises(spr.LucaError) as e:
                     book.send_to_luca(url=url, api_key="bad")
                 self.assertEqual(e.exception.status, 403)
+                with self.assertRaises(spr.LucaError) as e:
+                    book.send_to_luca(url=url, api_key="moved")
+                self.assertIn("redirect", str(e.exception))
         finally:
             server.shutdown()
 
@@ -229,3 +245,68 @@ class LargeBook(unittest.TestCase):
             self.assertEqual(len(parts), 4)
             for p in parts:
                 self.assertTrue(spr.verify_package(lambda n, p=p: p[n].encode() if n in p else None)["ok"])
+
+
+class GroupOne(unittest.TestCase):
+    def test_whose_package_it_is(self):
+        with tempfile.TemporaryDirectory() as d:
+            company = SprBook(dir=os.path.join(d, "company"), agent_id="agt", entity="Example Co")
+            company.seal(rail="stripe", source_id="pi_1", amount_minor=100, currency="USD", occurred_at="2026-10-28T12:00:00Z")
+            forger = SprBook(dir=os.path.join(d, "forger"), agent_id="agt", entity="Example Co")
+            forger.seal(rail="stripe", source_id="pi_1", amount_minor=999999, currency="USD", occurred_at="2026-10-28T12:00:00Z")
+            forger.export_package(os.path.join(d, "forged"))
+            loose = spr.verify_folder(os.path.join(d, "forged"))
+            self.assertEqual((loose["ok"], loose["trust"]), (True, "consistency-only"))
+            pem = company.public_key()["public_pem"]
+            strict = spr.verify_folder(os.path.join(d, "forged"), [pem])
+            self.assertEqual((strict["ok"], strict["trust"]), (False, "untrusted"))
+            company.export_package(os.path.join(d, "real"))
+            self.assertEqual(spr.verify_folder(os.path.join(d, "real"), [company.key_id])["trust"], "expected-key")
+
+    def test_the_checker_stays_inside_the_package(self):
+        with tempfile.TemporaryDirectory() as d:
+            book = SprBook(dir=os.path.join(d, "book"), agent_id="agt", entity="Example Co")
+            book.seal(rail="stripe", source_id="pi_1", amount_minor=100, currency="USD", occurred_at="2026-10-28T12:00:00Z")
+            with open(os.path.join(d, "secret.txt"), "w") as f:
+                f.write("not part of any package")
+            exp = os.path.join(d, "export")
+            book.export_package(exp)
+            with open(os.path.join(exp, "manifest.json"), encoding="utf-8") as f:
+                m = json.load(f)
+            for name in ["../secret.txt", os.path.join(d, "secret.txt"), "C:\\\\Windows\\\\win.ini", "sub/records.jsonl"]:
+                m["package"]["files"].append({"name": name, "sha256": "0"})
+            with open(os.path.join(exp, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(m, f)
+            out = spr.verify_folder(exp)
+            self.assertFalse(out["ok"])
+            self.assertEqual(sum(1 for r in out["results"] if r["what"] == "the manifest names only the package's own files"), 4)
+            self.assertFalse(any("secret.txt is the file" in r["what"] for r in out["results"]))
+            exp2 = os.path.join(d, "export2")
+            book.export_package(exp2)
+            recs = os.path.join(exp2, "records.jsonl")
+            os.replace(recs, os.path.join(d, "elsewhere.jsonl"))
+            try:
+                os.symlink(os.path.join(d, "elsewhere.jsonl"), recs)
+            except OSError:
+                return  # Windows lets only administrators and Developer Mode make links
+            out2 = spr.verify_folder(exp2)
+            self.assertFalse(out2["ok"])
+            self.assertTrue(any("is a link" in r["detail"] for r in out2["results"]))
+
+    def test_synced_folders_test_keys_and_exports(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                SprBook(dir=os.path.join(d, "Dropbox", "books"), agent_id="agt", entity="Example Co")
+            SprBook(dir=os.path.join(d, "Dropbox", "books"), agent_id="agt", entity="Example Co", allow_synced_folder=True)
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            test1 = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"))
+            with self.assertRaises(ValueError):
+                SprBook(dir=os.path.join(d, "t"), agent_id="agt", entity="Example Co", key=test1)
+            book = SprBook(dir=os.path.join(d, "book"), agent_id="agt", entity="Example Co")
+            book.seal(rail="stripe", source_id="pi_1", amount_minor=100, currency="USD", occurred_at="2026-10-28T12:00:00Z")
+            book.export_package(os.path.join(d, "e"))
+            with self.assertRaises(ValueError):
+                book.export_package(os.path.join(d, "e"))
+            self.assertTrue(book.export_package(os.path.join(d, "e"), overwrite=True)["verified"])
+            with self.assertRaises(ValueError):
+                book.export_package(os.path.join(d, "book"))

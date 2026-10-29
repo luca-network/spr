@@ -7,7 +7,8 @@
 //   SPR_OWNER      the person responsible for the agent
 //   SPR_TIME_ZONE  the company's time zone for accounting dates (default UTC)
 //   SPR_BINDING    "on" to return the nonce to sign with each intent
-//   LUCA_URL, LUCA_API_KEY   optional: Luca's address and an API key, for the send_to_luca tool
+//   SPR_EXPORT_DIR the folder exports go under (default: the book's exports folder)
+//   LUCA_URL, LUCA_API_KEY   optional: Luca's address (https) and an API key, for the send_to_luca tool
 //
 // Nothing may be printed to stdout: it carries the protocol.
 import { resolve } from "node:path";
@@ -24,5 +25,5 @@ const binding = (env.SPR_BINDING ?? "").toLowerCase() === "on";
 const book = new SprBook({ dir: resolve(env.SPR_DIR ?? "spr-books"), agentId: env.SPR_AGENT_ID, entity: env.SPR_ENTITY,
   owner: env.SPR_OWNER ?? null, timeZone: env.SPR_TIME_ZONE ?? "UTC", binding });
 const luca = env.LUCA_URL && env.LUCA_API_KEY ? { url: env.LUCA_URL, apiKey: env.LUCA_API_KEY } : undefined;
-await createSprMcpServer(book, { binding, luca }).connect(new StdioServerTransport());
+await createSprMcpServer(book, { binding, luca, exportDir: env.SPR_EXPORT_DIR ? resolve(env.SPR_EXPORT_DIR) : undefined }).connect(new StdioServerTransport());
 console.error(`SPR MCP server on stdio: sealing in ${book.dir} with key ${book.keyId}`);

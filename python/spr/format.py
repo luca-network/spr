@@ -369,42 +369,85 @@ def check_key_handover(row: dict, keys: dict) -> dict:
     return {"ok": v["ok"], "detail": "" if v["ok"] else "the handover is not the one sealed" if not v["hash_matches"] else "the earlier key's signature does not verify"}
 
 
-def verify_package(read: Callable[[str], Optional[bytes]]) -> dict:
+PACKAGE_FILES = ["manifest.json", "keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"]
+_KEY_ID = re.compile(r"ed25519:[0-9a-f]{16}")
+
+
+def check_record_set(payloads: list) -> dict:
+    """One record ID with two different contents, or two records of one payment with the same version, means two
+    writers sealed different facts (section 6)."""
+    problems, by_id, by_version = [], {}, {}
+    for p in payloads:
+        h = payload_sha256(p)
+        rid = (p or {}).get("record_id")
+        if rid in by_id and by_id[rid] != h:
+            problems.append(f"record {rid} appears twice with different content")
+        by_id[rid] = h
+        src = ((p or {}).get("source") or {}).get("id")
+        k = (p.get("entity"), p.get("rail"), src, p.get("version"))
+        if k in by_version and by_version[k] != rid:
+            problems.append(f"payment {src} on {p.get('rail')} has two version {p.get('version')} records: {by_version[k]} and {rid}")
+        by_version.setdefault(k, rid)
+    return {"ok": not problems, "problems": problems}
+
+
+def verify_package(read: Callable[[str], Optional[bytes]], expected_keys: Optional[list] = None) -> dict:
+    """Every check of a package (section 8). Without expected_keys the result shows the package is consistent with the
+    keys it carries (trust "consistency-only"). With the company's public keys or key IDs, every seal must be by one
+    of them or by a key one of them handed over to (trust "expected-key"); any other signer fails."""
     results = []
     def check(what, ok, detail=""):
         results.append({"what": what, "ok": bool(ok), "detail": detail})
         return ok
+    cache = {}
+    def get(name):
+        if name not in cache:
+            try:
+                cache[name] = read(name)
+            except Exception as e:  # a name outside the package, a link, an unreadable file
+                check(f"{name} can be read", False, str(e))
+                cache[name] = None
+        return cache[name]
     def jsonl(name):
-        b = read(name)
+        b = get(name)
         return [json.loads(l) for l in b.decode("utf-8").split("\n") if l.strip()] if b else []
-    holds_key = bool(read("key.pem"))
-    kind = "book" if holds_key and not read("manifest.json") else "package"
+    holds_key = bool(get("key.pem"))
+    kind = "book" if holds_key and not get("manifest.json") else "package"
     if kind == "book":
         check("this is a book's own folder: its seals and fields are checked below; it holds the private key, so share an export of it instead", True)
     elif holds_key:
         check("the package holds no private key", False, "key.pem is a private key and must never be shared")
     keys = {k["key_id"]: k for k in jsonl("keys.jsonl")}
+    signers = []
     def seal_ok(payload, seal):
         s = normalize_seal(seal or {})
+        if s["key_id"] not in signers:
+            signers.append(s["key_id"])
         k = keys.get(s["key_id"])
         if not k:
             return False, f"key {s['key_id']} is not in keys.jsonl"
         v = verify_seal(payload, s, k["public_pem"], k.get("algorithm") or s["algorithm"])
         return v["ok"], "" if v["ok"] else ("the payload's hash is not the sealed hash" if not v["hash_matches"] else "the signature does not verify with that key")
-    # A key handed over from an earlier one carries the handover, sealed by the earlier key (section 3).
+    good_handover = set()
     for k in keys.values():
         if not k.get("rotation"):
             continue
         c = check_key_handover(k, keys)
+        if c["ok"]:
+            good_handover.add(k["key_id"])
         check(f"key {k['key_id']} was handed over by key {(k['rotation'].get('payload') or {}).get('from')}, which sealed the handover", c["ok"], c["detail"])
-    mb = read("manifest.json")
+    mb = get("manifest.json")
     if kind == "package" and check("manifest.json is present", bool(mb)):
         m = json.loads(mb.decode("utf-8"))
         ok, why = seal_ok(m.get("package"), m.get("seal"))
         check("the manifest is sealed", ok, why)
         for f in (m.get("package") or {}).get("files", []):
-            b = read(f["name"])
-            check(f"{f['name']} is the file the manifest names", bool(b) and sha256_hex(b) == f["sha256"], "its SHA-256 differs" if b else "missing")
+            name = (f or {}).get("name")
+            if not isinstance(name, str) or name not in PACKAGE_FILES or name == "manifest.json":
+                check("the manifest names only the package's own files", False, f"{json.dumps(name)} is not one of {', '.join(PACKAGE_FILES[1:])}")
+                continue
+            b = get(name)
+            check(f"{name} is the file the manifest names", bool(b) and sha256_hex(b) == f["sha256"], "its SHA-256 differs" if b else "missing")
     intents, records = jsonl("intents.jsonl"), jsonl("records.jsonl")
     by_intent = {}
     for i in intents:
@@ -414,6 +457,11 @@ def verify_package(read: Callable[[str], Optional[bytes]]) -> dict:
         c = check_intent(p)
         check(f"intent {p.get('intent_id')} has the core fields", c["ok"], "; ".join(c["problems"]))
         by_intent[p.get("intent_id")] = i
+    for name in ["cancellations.jsonl", "checks.jsonl"]:
+        for row in jsonl(name):
+            p = row.get("payload") or {}
+            ok, why = seal_ok(p, row.get("seal"))
+            check(f"{'pre-payment check' if name == 'checks.jsonl' else 'withdrawal of intent'} {p.get('id') or p.get('intent_id')} is sealed", ok, why)
     by_record = {(r.get("payload") or {}).get("record_id"): r for r in records}
     for r in records:
         p = r.get("payload") or {}
@@ -433,8 +481,24 @@ def verify_package(read: Callable[[str], Optional[bytes]]) -> dict:
             if i and b.get("nonce"):
                 expected = intent_nonce(normalize_seal(i["seal"])["payload_sha256"], b["seq"] if isinstance(b.get("seq"), int) else 0)
                 check(f"record {p['record_id']}: bound only when the nonce is the intent's fingerprint", (b.get("status") == "bound") == (b["nonce"].lower() == expected), f"expected {expected}")
+    rs = check_record_set([r.get("payload") or {} for r in records])
+    check("no record ID holds two different records, and no payment has two records of one version", rs["ok"], "; ".join(rs["problems"]))
+    expected = [k if isinstance(k, str) and _KEY_ID.fullmatch(k) else key_id_for(k) for k in (expected_keys or [])]
+    trust = "consistency-only"
+    if expected:
+        trusted, grew = set(expected), True
+        while grew:
+            grew = False
+            for kid in good_handover:
+                if kid not in trusted and keys[kid]["rotation"]["payload"]["from"] in trusted:
+                    trusted.add(kid)
+                    grew = True
+        strangers = [k for k in signers if k not in trusted]
+        trust = "expected-key" if check(f"every seal is by the company's expected key {' or '.join(expected)}, or a key it handed over to", not strangers,
+                                        f"sealed by {', '.join(strangers)}, which the expected key did not hand over to" if strangers else "") else "untrusted"
     failed = sum(1 for r in results if not r["ok"])
-    return {"kind": kind, "ok": failed == 0, "passed": len(results) - failed, "failed": failed, "results": results}
+    return {"kind": kind, "ok": failed == 0, "trust": trust, "signers": signers, "expected_keys": expected,
+            "passed": len(results) - failed, "failed": failed, "results": results}
 
 
 # ---- the vectors -----------------------------------------------------------------------------------------
@@ -490,6 +554,9 @@ def run_vectors(v: dict) -> dict:
     for r in v["intents"]:
         c = check_intent(r["payload"])
         check(f"intent core fields: {r['name']}", c["ok"] == r["ok"], "; ".join(c["problems"]) or "it passed")
+    for r in v.get("record_sets", []):
+        c = check_record_set(r["records"])
+        check(f"record set: {r['name']}", c["ok"] == r["ok"], "; ".join(c["problems"]) or "it passed")
     for k in v.get("key_handovers", []):
         c = check_key_handover(k["key"], {x["key_id"]: x for x in k["keys"]})
         check(f"key handover: {k['name']}", c["ok"] == k["ok"], c["detail"] or "it passed")

@@ -36,11 +36,15 @@ res.luca.record;   // sealed, matched to its intent, bound on chain
 ## Check anything without Luca
 
 ```
-npx spr-verify ./books-export          # a package of records
-npx spr-verify --vectors               # the library against the test vectors
-python -m spr ./books-export
-python -m spr --vectors                # the Python SDK against the same vectors
+npx spr-verify ./books-export --key company.pem    # a package, and whose it is
+python -m spr ./books-export --key company.pem
+npx spr-verify --vectors                           # the library against the test vectors
+python -m spr --vectors                            # the Python SDK against the same vectors
 ```
+
+`company.pem` is the company's public key, obtained from the company and never from the package (`book.publicKey()` gives it). Without `--key` the checkers show only that a package is consistent with the keys it carries, and say so.
+
+Security problems: see [`SECURITY.md`](SECURITY.md).
 
 An implementation in any language conforms when it gives the same answers as `packages/spr/vectors/vectors.json`.
 

@@ -846,5 +846,199 @@
       "keys": [],
       "ok": false
     }
+  ],
+  "record_sets": [
+    {
+      "name": "a payment and its correction",
+      "records": [
+        {
+          "schema": "luca.record/0.7",
+          "record_id": "LR-X402-AB12CD34EF-v1",
+          "version": 1,
+          "supersedes": null,
+          "entity": "Example Co",
+          "entity_id": "example-co",
+          "rail": "x402",
+          "direction": "outflow",
+          "reported_by": "agent",
+          "source": {
+            "id": "0x5f2c0000000000000000000000000000000000000000000000000000000000aa"
+          },
+          "state": "cleared",
+          "amount_minor": 250000,
+          "currency": "USDC",
+          "occurred_at": "2026-10-21T17:04:05Z",
+          "time_zone": "UTC",
+          "settled_on": "2026-10-21",
+          "counterparty": "data.example"
+        },
+        {
+          "schema": "luca.record/0.7",
+          "record_id": "LR-X402-AB12CD34EF-v2",
+          "version": 2,
+          "supersedes": "LR-X402-AB12CD34EF-v1",
+          "entity": "Example Co",
+          "entity_id": "example-co",
+          "rail": "x402",
+          "direction": "outflow",
+          "reported_by": "agent",
+          "source": {
+            "id": "0x5f2c0000000000000000000000000000000000000000000000000000000000aa"
+          },
+          "state": "cleared",
+          "amount_minor": 250000,
+          "currency": "USDC",
+          "occurred_at": "2026-10-21T17:04:05Z",
+          "time_zone": "UTC",
+          "settled_on": "2026-10-21",
+          "counterparty": "data.example"
+        }
+      ],
+      "ok": true
+    },
+    {
+      "name": "the same record twice",
+      "records": [
+        {
+          "schema": "luca.record/0.7",
+          "record_id": "LR-X402-AB12CD34EF-v1",
+          "version": 1,
+          "supersedes": null,
+          "entity": "Example Co",
+          "entity_id": "example-co",
+          "rail": "x402",
+          "direction": "outflow",
+          "reported_by": "agent",
+          "source": {
+            "id": "0x5f2c0000000000000000000000000000000000000000000000000000000000aa"
+          },
+          "state": "cleared",
+          "amount_minor": 250000,
+          "currency": "USDC",
+          "occurred_at": "2026-10-21T17:04:05Z",
+          "time_zone": "UTC",
+          "settled_on": "2026-10-21",
+          "counterparty": "data.example"
+        },
+        {
+          "schema": "luca.record/0.7",
+          "record_id": "LR-X402-AB12CD34EF-v1",
+          "version": 1,
+          "supersedes": null,
+          "entity": "Example Co",
+          "entity_id": "example-co",
+          "rail": "x402",
+          "direction": "outflow",
+          "reported_by": "agent",
+          "source": {
+            "id": "0x5f2c0000000000000000000000000000000000000000000000000000000000aa"
+          },
+          "state": "cleared",
+          "amount_minor": 250000,
+          "currency": "USDC",
+          "occurred_at": "2026-10-21T17:04:05Z",
+          "time_zone": "UTC",
+          "settled_on": "2026-10-21",
+          "counterparty": "data.example"
+        }
+      ],
+      "ok": true
+    },
+    {
+      "name": "one record ID, two amounts",
+      "records": [
+        {
+          "schema": "luca.record/0.7",
+          "record_id": "LR-X402-AB12CD34EF-v1",
+          "version": 1,
+          "supersedes": null,
+          "entity": "Example Co",
+          "entity_id": "example-co",
+          "rail": "x402",
+          "direction": "outflow",
+          "reported_by": "agent",
+          "source": {
+            "id": "0x5f2c0000000000000000000000000000000000000000000000000000000000aa"
+          },
+          "state": "cleared",
+          "amount_minor": 250000,
+          "currency": "USDC",
+          "occurred_at": "2026-10-21T17:04:05Z",
+          "time_zone": "UTC",
+          "settled_on": "2026-10-21",
+          "counterparty": "data.example"
+        },
+        {
+          "schema": "luca.record/0.7",
+          "record_id": "LR-X402-AB12CD34EF-v1",
+          "version": 1,
+          "supersedes": null,
+          "entity": "Example Co",
+          "entity_id": "example-co",
+          "rail": "x402",
+          "direction": "outflow",
+          "reported_by": "agent",
+          "source": {
+            "id": "0x5f2c0000000000000000000000000000000000000000000000000000000000aa"
+          },
+          "state": "cleared",
+          "amount_minor": 250001,
+          "currency": "USDC",
+          "occurred_at": "2026-10-21T17:04:05Z",
+          "time_zone": "UTC",
+          "settled_on": "2026-10-21",
+          "counterparty": "data.example"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "name": "two version 1 records of one payment",
+      "records": [
+        {
+          "schema": "luca.record/0.7",
+          "record_id": "LR-X402-AB12CD34EF-v1",
+          "version": 1,
+          "supersedes": null,
+          "entity": "Example Co",
+          "entity_id": "example-co",
+          "rail": "x402",
+          "direction": "outflow",
+          "reported_by": "agent",
+          "source": {
+            "id": "0x5f2c0000000000000000000000000000000000000000000000000000000000aa"
+          },
+          "state": "cleared",
+          "amount_minor": 250000,
+          "currency": "USDC",
+          "occurred_at": "2026-10-21T17:04:05Z",
+          "time_zone": "UTC",
+          "settled_on": "2026-10-21",
+          "counterparty": "data.example"
+        },
+        {
+          "schema": "luca.record/0.7",
+          "record_id": "LR-X402-FFFFFFFFFF-v1",
+          "version": 1,
+          "supersedes": null,
+          "entity": "Example Co",
+          "entity_id": "example-co",
+          "rail": "x402",
+          "direction": "outflow",
+          "reported_by": "agent",
+          "source": {
+            "id": "0x5f2c0000000000000000000000000000000000000000000000000000000000aa"
+          },
+          "state": "cleared",
+          "amount_minor": 250000,
+          "currency": "USDC",
+          "occurred_at": "2026-10-21T17:04:05Z",
+          "time_zone": "UTC",
+          "settled_on": "2026-10-21",
+          "counterparty": "data.example"
+        }
+      ],
+      "ok": false
+    }
   ]
 }

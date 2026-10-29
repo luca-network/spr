@@ -31,7 +31,7 @@ Add this to `claude_desktop_config.json`:
 | `get_intent` | One intent: open, matched, expired or withdrawn |
 | `verify_record` | Check a record's seal |
 | `list_records` | The book's current records |
-| `export_package` | A copy of the book with a sealed manifest, for an auditor or a counterparty |
+| `export_package` | A copy of the book with a sealed manifest, into a named folder under the export folder, for an auditor or a counterparty |
 | `send_to_luca` | Send the book to Luca's hosted service (only when `LUCA_URL` and `LUCA_API_KEY` are set) |
 
 Check an export with `npx spr-verify <folder>`, with no Luca code.
@@ -46,6 +46,7 @@ Check an export with `npx spr-verify <folder>`, with no Luca code.
 | `SPR_OWNER` | The person responsible for the agent |
 | `SPR_TIME_ZONE` | The company's time zone, for accounting dates (default UTC) |
 | `SPR_BINDING` | `on` to return the nonce to sign with each intent |
+| `SPR_EXPORT_DIR` | The folder exports go under (default: `exports` inside the book's folder). The `export_package` tool takes a folder name, never a path |
 | `LUCA_URL`, `LUCA_API_KEY` | Optional: Luca's address and an API key, which add the `send_to_luca` tool |
 
 The folder holds the company's private key (`key.pem`). Keep it out of source control. Another process can use the same folder at the same time, such as a script or a second MCP client; each write takes `book.lock` for a moment, so nothing is lost.

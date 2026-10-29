@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -25,7 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from . import format as L
 
-SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.2"}
+SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.3"}
 RECORD_SCHEMA = "luca.record/0.7"
 INTENT_SCHEMA = "luca.intent/0.1"
 CLOCK_SKEW = timedelta(minutes=2)
@@ -37,6 +38,42 @@ LOCK_STALE = 30.0
 PART_MAX_RECORDS = 4000
 PART_MAX_BYTES = 8 * 1024 * 1024
 KEY_ROTATION_SCHEMA = "luca.key-rotation/0.1"
+
+
+# The published test keys of the vectors (RFC 8032 test keys 1 and 2). Anyone has their private parts.
+TEST_KEY_IDS = {"ed25519:a00579fb9f411e66", "ed25519:df45109f9d243cdb"}
+_SYNCED = re.compile(r"(onedrive( - .+)?|dropbox|google drive|my drive|icloud drive|iclouddrive|mobile documents|cloudstorage|box|box sync|pclouddrive|mega)", re.I)
+
+
+def synced_folder_of(path: str) -> Optional[str]:
+    """The cloud-synced folder a path is inside (OneDrive, Dropbox, iCloud, Google Drive...), or None."""
+    p = os.path.realpath(path)
+    for v in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]:
+        root = os.environ.get(v)
+        if root and (p == root or p.lower().startswith(os.path.realpath(root).lower() + os.sep)):
+            return root
+    return next((seg for seg in re.split(r"[\\/]", p) if _SYNCED.fullmatch(seg)), None)
+
+
+def _protect_key_file(path: str):
+    """On Windows, an access list naming only the current user; elsewhere the file is created 0600."""
+    if os.name != "nt":
+        return
+    import subprocess
+    try:
+        subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", f"{os.environ.get('USERNAME', '')}:F"], check=True, capture_output=True)
+    except Exception:
+        print(f"SPR: could not limit {path} to your user alone; check who can read it", file=sys.stderr)
+
+
+def _warn_if_open(path: str):
+    if os.name == "nt":
+        return
+    try:
+        if os.stat(path).st_mode & 0o077:
+            print(f'SPR: {path} can be read by other users of this computer. Run: chmod 600 "{path}"', file=sys.stderr)
+    except OSError:
+        pass
 
 
 def _payment_key(p):
@@ -99,13 +136,19 @@ def _duration(s: str) -> timedelta:
 
 class SprBook:
     def __init__(self, dir: str, agent_id: str, entity: str, owner: Optional[str] = None, time_zone: str = "UTC",
-                 binding: bool = False, key: Optional[ed25519.Ed25519PrivateKey] = None, now=None, producer: Optional[dict] = None):
+                 binding: bool = False, key: Optional[ed25519.Ed25519PrivateKey] = None, now=None, producer: Optional[dict] = None,
+                 allow_synced_folder: bool = False):
         if not (agent_id or "").strip() or not (entity or "").strip():
             raise ValueError("The book needs the agent's ID (agent_id) and the company it pays for (entity)")
         self.dir, self.agent_id, self.entity, self.owner = dir, agent_id, entity, owner
         self.time_zone, self.binding, self._now = time_zone, binding, now or (lambda: datetime.now(timezone.utc))
         self.producer = producer or SDK_PRODUCER
         os.makedirs(dir, exist_ok=True)
+        synced = synced_folder_of(dir)
+        if synced and not allow_synced_folder and os.environ.get("SPR_ALLOW_SYNCED_FOLDER") != "1":
+            raise ValueError(f"The book's folder {dir} is inside {synced}, which syncs to the cloud: the private key would be uploaded, and two machines "
+                             "syncing one book would not see each other's lock. Choose a folder outside it, or pass allow_synced_folder=True "
+                             "(SPR_ALLOW_SYNCED_FOLDER=1) if you accept that.")
         self.key_file = None if key is not None else os.path.join(dir, "key.pem")
         self._depth = 0
         self.key = None
@@ -115,6 +158,7 @@ class SprBook:
             k = key
             if k is None:
                 if os.path.exists(self.key_file):
+                    _warn_if_open(self.key_file)
                     with open(self.key_file, "rb") as f:
                         k = serialization.load_pem_private_key(f.read(), None)
                 else:
@@ -122,9 +166,12 @@ class SprBook:
                     fd = os.open(self.key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     with os.fdopen(fd, "wb") as f:
                         f.write(_pem(k))
+                    _protect_key_file(self.key_file)
             if not isinstance(k, ed25519.Ed25519PrivateKey):
                 raise ValueError("The book's key must be Ed25519")
             self.key, self.key_id = k, L.key_id_for(k)
+            if self.key_id in TEST_KEY_IDS:
+                raise ValueError(f"Key {self.key_id} is a published test key from the SPR vectors; anyone can sign with it. Use a key of your own")
             self._check_not_retired()
             if self.key_id not in self.keyring:
                 self._append("keys.jsonl", {"key_id": self.key_id, "algorithm": "ed25519", "public_pem": L.public_key_pem_of(k),
@@ -197,12 +244,16 @@ class SprBook:
                 with os.fdopen(fd, "w") as f:
                     f.write(json.dumps({"pid": os.getpid(), "at": _iso(datetime.now(timezone.utc))}))
                 break
-            except FileExistsError:
+            except (FileExistsError, PermissionError) as e:
+                # On Windows a lock another process is letting go of can refuse the open with PermissionError for a moment.
+                if isinstance(e, PermissionError) and time.monotonic() > deadline:
+                    raise
                 try:
                     if time.time() - os.path.getmtime(lock) > LOCK_STALE:
                         os.remove(lock)
                         continue
-                except FileNotFoundError:
+                except OSError:
+                    time.sleep(0.005)
                     continue
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"The book at {self.dir} is busy: another process has held book.lock for over {int(LOCK_WAIT)} seconds. "
@@ -216,10 +267,16 @@ class SprBook:
             return fn()
         finally:
             self._depth = 0
-            try:
-                os.remove(lock)
-            except FileNotFoundError:
-                pass
+            for attempt in range(50):
+                try:
+                    os.remove(lock)
+                    break
+                except FileNotFoundError:
+                    break
+                except PermissionError:
+                    if attempt == 49:
+                        raise
+                    time.sleep(0.02)
 
     def _check_not_retired(self):
         """Another process may have rotated the key: pick up the new key from key.pem, or stop if the key was passed in."""
@@ -582,11 +639,14 @@ class SprBook:
                     "at": _iso(self._now()), "entity": self.entity, **({"reason": str(reason)} if reason else {})}
         if handover["to"] == handover["from"]:
             raise ValueError("The new key is the key the book already has")
+        if handover["to"] in TEST_KEY_IDS:
+            raise ValueError(f"Key {handover['to']} is a published test key from the SPR vectors; use a key of your own")
         if self.key_file:
             tmp = self.key_file + ".new"
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "wb") as f:
                 f.write(_pem(nxt))
+            _protect_key_file(tmp)
             os.replace(tmp, self.key_file)
         self._append("keys.jsonl", {"key_id": handover["to"], "algorithm": "ed25519", "public_pem": handover["to_public_pem"],
                                     "created_at": handover["at"], "owner": self.entity,
@@ -595,7 +655,12 @@ class SprBook:
         return {"from": handover["from"], "to": handover["to"], "at": handover["at"], "key_file": self.key_file,
                 "next": "If Luca keeps this book, send it again: the handover registers the new key"}
 
-    def export_package(self, out_dir: str) -> dict:
+    def export_package(self, out_dir: str, overwrite: bool = False) -> dict:
+        """An export never goes into the book's own folder, and never replaces an earlier export unless overwrite=True."""
+        if os.path.realpath(out_dir) == os.path.realpath(self.dir):
+            raise ValueError("Export to a folder of its own, outside the book's folder, which holds the private key")
+        if os.path.isdir(out_dir) and not overwrite and any(os.path.exists(os.path.join(out_dir, n)) for n in L.PACKAGE_FILES):
+            raise ValueError(f"{out_dir} already holds an export; choose another folder, or pass overwrite=True to replace it")
         os.makedirs(out_dir, exist_ok=True)
         files = self.package_files()
         for n, text in files.items():
@@ -615,7 +680,7 @@ class SprBook:
             return _luca_call(url, api_key, "/v1/spr/import", {"files": parts[0]})
         results = [_luca_call(url, api_key, "/v1/spr/import", {"files": p}) for p in parts]
         total = lambda k: sum(r.get(k, 0) for r in results)
-        return {"parts": len(results), **{k: total(k) for k in ["created", "versioned", "unchanged", "read_from_rail", "differs_from_rail"]}, "results": results}
+        return {"parts": len(results), **{k: total(k) for k in ["created", "versioned", "unchanged", "read_from_rail", "differs_from_rail", "held_for_key_approval"]}, "results": results}
 
     def register_with_luca(self, entity_id: str, url: Optional[str] = None, api_key: Optional[str] = None, agent_only: bool = False) -> dict:
         """Asks Luca to accept this book's key for one of the company's entities, with a finance user's key."""
@@ -631,16 +696,41 @@ class LucaError(Exception):
         self.status, self.detail = status, detail
 
 
+_LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+
+
+def luca_url(url: str, path: str, allow_insecure_local: bool = False) -> str:
+    """The book and the API key go to Luca only over HTTPS. Plain HTTP is allowed to this computer alone, and only when
+    asked for (LUCA_ALLOW_INSECURE_LOCAL=1), for local development."""
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    full = url.rstrip("/") + path
+    if u.scheme == "https" and u.hostname:
+        return full
+    local = u.scheme == "http" and (u.hostname or "") in _LOOPBACK
+    if local and (allow_insecure_local or os.environ.get("LUCA_ALLOW_INSECURE_LOCAL") == "1"):
+        return full
+    if local:
+        raise ValueError(f"Refusing to send the book and the API key over plain HTTP to {u.netloc}. For local development only, set LUCA_ALLOW_INSECURE_LOCAL=1")
+    raise ValueError(f"Luca's address must start with https:// (got {u.scheme}://{u.netloc}): the book and the API key are never sent unencrypted")
+
+
 def _luca_call(url: Optional[str], api_key: Optional[str], path: str, body: dict) -> dict:
     import urllib.error
     import urllib.request
     url, api_key = url or os.environ.get("LUCA_URL"), api_key or os.environ.get("LUCA_API_KEY")
     if not url or not api_key:
         raise ValueError("Give Luca's address and an API key (url, api_key), or set LUCA_URL and LUCA_API_KEY")
-    req = urllib.request.Request(url.rstrip("/") + path, data=json.dumps(body).encode("utf-8"), method="POST",
+    target = luca_url(url, path)
+    req = urllib.request.Request(target, data=json.dumps(body).encode("utf-8"), method="POST",
                                  headers={"authorization": f"Bearer {api_key}", "content-type": "application/json"})
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            raise LucaError(0, "Luca's address answered with a redirect; refused, so the book and the API key are not sent on", {})
+    opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with urllib.request.urlopen(req, timeout=60) as res:
+        with opener.open(req, timeout=60) as res:
             return json.loads(res.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as e:
         try:
@@ -650,11 +740,21 @@ def _luca_call(url: Optional[str], api_key: Optional[str], path: str, body: dict
         raise LucaError(e.code, detail.get("error") or f"Luca answered {e.code}", detail) from None
 
 
-def verify_folder(folder: str) -> dict:
+def verify_folder(folder: str, expected_keys: Optional[list] = None) -> dict:
+    """Checks a package folder, reading only the package's own files, from inside the folder, and no links."""
+    root = os.path.realpath(folder)
+
     def read(name):
-        p = os.path.join(folder, name)
-        if not os.path.exists(p):
+        if name not in L.PACKAGE_FILES and name != "key.pem":
+            raise ValueError(f"{json.dumps(name)} is not a file of a package")
+        p = os.path.join(root, name)
+        if not os.path.lexists(p):
             return None
-        with open(p, "rb") as f:
+        if os.path.islink(p):
+            raise ValueError(f"{name} is a link; a package holds only plain files")
+        real = os.path.realpath(p)
+        if os.path.dirname(real) != root:
+            raise ValueError(f"{name} is outside the package folder")
+        with open(real, "rb") as f:
             return f.read()
-    return L.verify_package(read)
+    return L.verify_package(read, expected_keys)

@@ -25,7 +25,18 @@ test("spr-mcp: an MCP client starts the server over stdio, as Claude Desktop doe
     assert.equal(rec.binding, "bound");
     const bad = await client.callTool({ name: "get_intent", arguments: { intent_id: "int_none" } });
     assert.equal(bad.isError, true);
-    const out = text(await client.callTool({ name: "export_package", arguments: { folder: join(dir, "export") } }));
+    // Exports go under the book's exports folder, by name. A path, or a name that climbs out, is refused, whatever
+    // a payment's memo asks for; an earlier export is not replaced unless asked.
+    for (const name of [join(dir, "elsewhere"), "../elsewhere", "a/b", "..", ""]) {
+      const r = await client.callTool({ name: "export_package", arguments: { name } });
+      assert.equal(r.isError, true, name);
+    }
+    const out = text(await client.callTool({ name: "export_package", arguments: { name: "audit-1" } }));
     assert.equal(out.verified, true);
-  } finally { await client.close(); rmSync(dir, { recursive: true, force: true }); }
+    assert.equal(out.folder, join(dir, "exports", "audit-1"));
+    const again = await client.callTool({ name: "export_package", arguments: { name: "audit-1" } });
+    assert.equal(again.isError, true);
+    assert.equal(text(await client.callTool({ name: "export_package", arguments: { name: "audit-1", overwrite: true } })).verified, true);
+    assert.match(tools.find((t) => t.name === "list_records").description, /data, never instructions/);
+  } finally { await client.close(); rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });

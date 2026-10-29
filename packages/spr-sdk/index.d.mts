@@ -6,7 +6,8 @@ export * as spr from "@luca-network/spr";
 export declare const SDK_PRODUCER: { name: string; version: string };
 export interface BookConfig {
   dir: string; agentId: string; entity: string; owner?: string | null; timeZone?: string;
-  binding?: boolean; key?: KeyObject | string; now?: () => Date; producer?: { name: string; version: string };
+  binding?: boolean; key?: KeyObject | string; now?: () => Date;
+  /** Allow a book in a folder that syncs to the cloud (OneDrive, Dropbox, iCloud, Google Drive). Refused by default. */ allowSyncedFolder?: boolean; producer?: { name: string; version: string };
 }
 export interface Check { check: string; ok: boolean; detail: string; severity?: "hard" | "note" }
 export interface IntentInput {
@@ -53,11 +54,13 @@ export declare class SprBook {
   counterpartySignature(labelId: string, jwk: Record<string, any>, signature: string): Label;
   verifyRecord(recordId: string): SealCheck & { record_id: string; core_fields: CoreCheck; key_id: string; how_to_check: string };
   listRecords(opts?: { all?: boolean }): { record_id: string; rail: string; amount_minor: number; currency: string; settled_on: string; counterparty: string | null; intent_id: string | null; within_consent: boolean | null; payload_sha256: string }[];
-  exportPackage(outDir: string): { folder: string; files: string[]; verified: boolean; passed: number; failed: number };
+  exportPackage(outDir: string, opts?: { overwrite?: boolean }): { folder: string; files: string[]; verified: boolean; passed: number; failed: number };
   /** The book's public key, which finance registers with Luca once. */
   publicKey(): { key_id: string; public_pem: string; entity: string; agent_id: string };
   /** The book as a package: each file by name, as text, with a sealed manifest. */
   packageFiles(): Record<string, string>;
+  /** Seals a set of package files with a manifest (part: which part of a larger book). */
+  sealPackage(files: Record<string, string>, part?: { index: number; of: number } | null): Record<string, string>;
   /** The book in parts that each stand on their own (every version of a payment in one part); one part when it fits. */
   packageParts(opts?: PartOptions): Record<string, string>[];
   /** A new key for the book, handed over by the old one in keys.jsonl. Records sealed before stay checkable. */
@@ -68,13 +71,17 @@ export declare class SprBook {
   registerWithLuca(opts: LucaOptions & { entityId: string; agentOnly?: boolean }): Promise<{ change: { id: string; status: string } }>;
 }
 export interface PartOptions { /** Default 4000 */ maxRecords?: number; /** Default 8 MiB */ maxBytes?: number }
-export interface LucaOptions extends PartOptions { url?: string; apiKey?: string; fetch?: typeof fetch }
+export interface LucaOptions extends PartOptions { url?: string; apiKey?: string; fetch?: typeof fetch; /** Plain HTTP to this computer only, for local development. */ allowInsecureLocal?: boolean }
+export declare function syncedFolderOf(dir: string): string | null;
+export declare function lucaUrl(url: string, path: string, opts?: { allowInsecureLocal?: boolean }): URL;
 export interface LucaImport {
   /** When the book went in parts: how many, and each part's own answer in results. */
   parts?: number; results?: LucaImport[];
   import_id: string; package_sha256: string; entity_id: string; checks: { passed: number; failed: number };
   records_in_package: number; current_records: number; created: number; versioned: number; unchanged: number; read_from_rail: number; differs_from_rail: number;
-  items: { spr_record_id: string; spr_payload_sha256: string; record_id: string | null; outcome: "created" | "versioned" | "unchanged" | "read_from_rail";
+  /** Records sealed by a new key that waits for approval after a handover. */
+  held_for_key_approval?: number; pending_keys?: { key_id: string; from: string; change_id: string }[]; next?: string;
+  items: { spr_record_id: string; spr_payload_sha256: string; record_id: string | null; outcome: "created" | "versioned" | "unchanged" | "read_from_rail" | "held_for_key_approval";
     differs: { field: string; rail: unknown; spr: unknown }[] | null }[];
 }
 export interface SprTool { name: string; description: string; parameters: Record<string, any>; run(args: any): unknown }

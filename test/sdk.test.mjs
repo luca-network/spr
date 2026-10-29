@@ -81,7 +81,7 @@ test("withLuca: one wrapped fetch declares the intent, pays bound to it, and sea
     assert.equal(book.listRecords().length, 1);
     // Without luca options the fetch passes through untouched.
     assert.equal((await pay("https://data.example/free")).status, 200);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test("the book's calls as tools in the OpenAI Agents SDK and LangChain", async () => {
@@ -101,7 +101,7 @@ test("the book's calls as tools in the OpenAI Agents SDK and LangChain", async (
     assert.equal(sealed.within_consent, true);
     const bad = JSON.parse(await lc.find((t) => t.name === "get_intent").invoke({ intent_id: "int_none" }));
     assert.match(bad.error, /No intent int_none/);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test("a label: the company signs its side, the counterparty's P-256 signature agrees it, and both check with the SPR library alone", async () => {
@@ -122,7 +122,7 @@ test("a label: the company signs its side, the counterparty's P-256 signature ag
     assert.equal(agreed.state, "agreed");
     assert.throws(() => book.counterpartySignature(label.label_id, jwk, spr.signLabel(cp.privateKey, label.label_id, "0".repeat(64))), /does not verify/);
     assert.throws(() => book.counterpartySignature(label.label_id, { ...jwk, d: "x" }, sig), /private key/);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test("Python and JavaScript read each other's books: either seals, the other checks and carries on", async (t) => {
@@ -165,7 +165,7 @@ b = spr.SprBook(dir=${JSON.stringify(dir)}, agent_id="agt_cross", entity="Exampl
 assert b.export_package(${JSON.stringify(join(dir, "export-py"))})["verified"]`);
     const js = spr.verifyPackage((n) => existsSync(join(dir, "export-py", n)) ? readFileSync(join(dir, "export-py", n)) : null);
     assert.equal(js.failed, 0, JSON.stringify(js.results.filter((r) => !r.ok)));
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test("sendToLuca: the book goes as a package whose sealed manifest checks with the SPR library alone; Luca's refusal comes back as an error", async () => {
@@ -194,7 +194,7 @@ test("sendToLuca: the book goes as a package whose sealed manifest checks with t
     const refuse = async () => new Response(JSON.stringify({ error: "Key ed25519:x is not registered with Luca" }), { status: 403 });
     await assert.rejects(book.sendToLuca({ url: "https://luca.example", apiKey: "k_1", fetch: refuse }), (e) => e.status === 403 && /not registered/.test(e.message));
     await assert.rejects(book.sendToLuca({ fetch }), /LUCA_URL/);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test("times: one without its offset is refused; the accounting date follows the book's time zone (UTC by default), whatever the computer's", async () => {
@@ -216,7 +216,7 @@ test("times: one without its offset is refused; the accounting date follows the 
     assert.equal(la.seal({ rail: "stripe", source_id: "pi_3", amount_minor: 100, currency: "USD" }).status, "unchanged");
     const settle = sprTools(la).find((t) => t.name === "record_settlement");
     assert.throws(() => settle.run({ rail: "stripe", source_id: "pi_4", amount_minor: 100, currency: "USD" }), /occurred_at is required/);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test("authority: the book's own limits are reported as self-declared; a book's folder checks as a book; a package holding the private key fails", async () => {
@@ -241,7 +241,7 @@ test("authority: the book's own limits are reported as self-declared; a book's f
     const leaked = spr.verifyPackage(read(exp));
     assert.equal(leaked.ok, false);
     assert.ok(leaked.results.some((r) => r.what === "the package holds no private key" && !r.ok));
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test("one writer at a time: four processes sealing into one book lose nothing and seal each payment once", async () => {
@@ -269,7 +269,7 @@ test("one writer at a time: four processes sealing into one book lose nothing an
     assert.equal(new Set(lines.map((r) => r.payload.record_id)).size, lines.length);
     const read = (n) => existsSync(join(dir, n)) ? readFileSync(join(dir, n)) : null;
     assert.equal(spr.verifyPackage(read).ok, true);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test("key rotation: the new key is handed over by the old one; old records still check; another open copy of the book follows the new key", async () => {
@@ -289,7 +289,7 @@ test("key rotation: the new key is handed over by the old one; old records still
     assert.ok(v.results.some((x) => x.what === `key ${r.to} was handed over by key ${r.from}, which sealed the handover` && x.ok));
     const forged = readFileSync(join(dir, "keys.jsonl"), "utf8").replace("Yearly rotation", "Forged");
     assert.equal(spr.verifyPackage((n) => n === "keys.jsonl" ? Buffer.from(forged) : read(n)).ok, false);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test("a large book: sealing stays quick, and it goes to Luca in parts that each check on their own", async () => {
@@ -308,5 +308,100 @@ test("a large book: sealing stays quick, and it goes to Luca in parts that each 
     const fetch = async (_url, init) => { sent++; const f = JSON.parse(init.body).files; return new Response(JSON.stringify({ created: f["records.jsonl"].trim().split("\n").length }), { status: 201 }); };
     const out = await book.sendToLuca({ url: "https://luca.example", apiKey: "k", fetch, maxRecords: 1000 });
     assert.deepEqual([sent, out.parts, out.created], [4, 4, 3200]);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
+});
+
+test("whose package it is: a package sealed by another key passes only as consistency; with the company's key it fails, and the company's own passes", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "spr-trust-"));
+  try {
+    const company = new SprBook({ dir: join(dir, "company"), agentId: "agt", entity: "Example Co" });
+    company.seal({ rail: "stripe", source_id: "pi_1", amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" });
+    const forger = new SprBook({ dir: join(dir, "forger"), agentId: "agt", entity: "Example Co" });
+    forger.seal({ rail: "stripe", source_id: "pi_1", amount_minor: 999999, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" });
+    const read = (d) => (n) => existsSync(join(d, n)) ? readFileSync(join(d, n)) : null;
+    forger.exportPackage(join(dir, "forged"));
+    company.exportPackage(join(dir, "real"));
+    const loose = spr.verifyPackage(read(join(dir, "forged")));
+    assert.deepEqual([loose.ok, loose.trust], [true, "consistency-only"]);
+    const pem = company.publicKey().public_pem;
+    const strict = spr.verifyPackage(read(join(dir, "forged")), { expectedKeys: [pem] });
+    assert.deepEqual([strict.ok, strict.trust], [false, "untrusted"]);
+    assert.deepEqual([spr.verifyPackage(read(join(dir, "real")), { expectedKeys: [company.keyId] }).trust], ["expected-key"]);
+    // After a rotation the company's old key still vouches for the new one.
+    company.rotateKey();
+    company.seal({ rail: "stripe", source_id: "pi_2", amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" });
+    company.exportPackage(join(dir, "rotated"));
+    assert.equal(spr.verifyPackage(read(join(dir, "rotated")), { expectedKeys: [pem] }).trust, "expected-key");
+    // Two writers that bypassed the lock: one record ID, two amounts. The checker fails it.
+    const rec = readFileSync(join(dir, "company", "records.jsonl"), "utf8").trim().split("\n")[0];
+    const files = { ...company.packageFiles() };
+    // (sealed by the current key, so the seal itself checks; only the duplicate is wrong)
+    const tw = JSON.parse(rec); tw.payload.amount_minor = 2000; tw.seal = spr.sealWith(tw.payload, readFileSync(join(dir, "company", "key.pem"), "utf8"));
+    files["records.jsonl"] += JSON.stringify(tw) + "\n";
+    const resealed = company.sealPackage(Object.fromEntries(Object.entries(files).filter(([n]) => n !== "manifest.json")));
+    const dup = spr.verifyPackage((n) => resealed[n] === undefined ? null : Buffer.from(resealed[n]));
+    assert.equal(dup.ok, false);
+    assert.ok(dup.results.some((r) => !r.ok && /appears twice with different content/.test(r.detail)));
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
+});
+
+test("the checker stays inside the package: names outside the package, absolute paths and links are refused", async () => {
+  const { writeFileSync, symlinkSync } = await import("node:fs");
+  const { execFileSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const dir = mkdtempSync(join(tmpdir(), "spr-paths-"));
+  const cli = (args) => { try { return { code: 0, out: execFileSync(process.execPath, [fileURLToPath(import.meta.resolve("@luca-network/spr")).replace(/index\.mjs$/, "bin/spr-verify.mjs"), ...args], { encoding: "utf8" }) }; } catch (e) { return { code: e.status, out: String(e.stdout) }; } };
+  try {
+    const book = new SprBook({ dir: join(dir, "book"), agentId: "agt", entity: "Example Co" });
+    book.seal({ rail: "stripe", source_id: "pi_1", amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" });
+    writeFileSync(join(dir, "secret.txt"), "not part of any package");
+    const files = book.packageFiles();
+    const m = JSON.parse(files["manifest.json"]);
+    for (const name of ["../secret.txt", join(dir, "secret.txt"), "C:\\Windows\\win.ini", "sub/records.jsonl"]) m.package.files.push({ name, sha256: "0" });
+    const exp = join(dir, "export"); book.exportPackage(exp);
+    writeFileSync(join(exp, "manifest.json"), JSON.stringify(m));
+    const r = cli([exp]);
+    assert.equal(r.code, 1);
+    assert.equal((r.out.match(/the manifest names only the package's own files/g) ?? []).length, 4);
+    assert.ok(!/secret\.txt is the file the manifest names/.test(r.out));
+    const exp2 = join(dir, "export2"); book.exportPackage(exp2);
+    const recs = join(exp2, "records.jsonl"); writeFileSync(join(dir, "elsewhere.jsonl"), readFileSync(recs)); rmSync(recs);
+    // Windows lets only administrators and Developer Mode make links; without that there is no link to refuse.
+    try { symlinkSync(join(dir, "elsewhere.jsonl"), recs); } catch (e) { if (e.code === "EPERM") return; throw e; }
+    const r2 = cli([exp2]);
+    assert.equal(r2.code, 1);
+    assert.match(r2.out, /records\.jsonl is a link/);
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
+});
+
+test("sending to Luca: only https, plain http only to this computer when asked, redirects refused; synced folders and published test keys refused", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spr-safe-"));
+  try {
+    const book = new SprBook({ dir: join(dir, "book"), agentId: "agt", entity: "Example Co" });
+    book.seal({ rail: "stripe", source_id: "pi_1", amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" });
+    const calls = [];
+    const ok = async (url) => { calls.push(url); return new Response(JSON.stringify({ created: 1 }), { status: 201 }); };
+    await assert.rejects(book.sendToLuca({ url: "http://luca.example", apiKey: "k", fetch: ok }), /https:\/\//);
+    await assert.rejects(book.sendToLuca({ url: "http://127.0.0.1:8080", apiKey: "k", fetch: ok }), /LUCA_ALLOW_INSECURE_LOCAL/);
+    assert.deepEqual(calls, []);
+    assert.equal((await book.sendToLuca({ url: "http://127.0.0.1:8080", apiKey: "k", fetch: ok, allowInsecureLocal: true })).created, 1);
+    await assert.rejects(book.sendToLuca({ url: "http://luca.example", apiKey: "k", fetch: ok, allowInsecureLocal: true }), /https:\/\//);
+    const moved = async () => new Response(null, { status: 302, headers: { location: "http://elsewhere.example" } });
+    await assert.rejects(book.sendToLuca({ url: "https://luca.example", apiKey: "k", fetch: moved }), /redirect/);
+    // A book inside a synced folder is refused unless allowed.
+    const synced = join(dir, "OneDrive", "books");
+    assert.throws(() => new SprBook({ dir: synced, agentId: "agt", entity: "Example Co" }), /syncs to the cloud/);
+    assert.ok(new SprBook({ dir: synced, agentId: "agt", entity: "Example Co", allowSyncedFolder: true }));
+    // The vectors' published test keys are refused.
+    const { createPrivateKey } = await import("node:crypto");
+    const seed = Buffer.from("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", "hex");
+    const test1 = createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]), format: "der", type: "pkcs8" });
+    assert.throws(() => new SprBook({ dir: join(dir, "t"), agentId: "agt", entity: "Example Co", key: test1 }), /published test key/);
+    // An export never replaces an earlier one unless asked, and never goes into the book's own folder.
+    book.exportPackage(join(dir, "e"));
+    assert.throws(() => book.exportPackage(join(dir, "e")), /already holds an export/);
+    assert.equal(book.exportPackage(join(dir, "e"), { overwrite: true }).verified, true);
+    assert.throws(() => book.exportPackage(join(dir, "book")), /outside the book's folder/);
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });

@@ -16,11 +16,13 @@
 //   intents.jsonl, cancellations.jsonl, checks.jsonl, records.jsonl, labels.jsonl   each sealed: { payload, seal }
 //   mandate.json         optional: the limits the agent acts under (currency, per payment, validity)
 import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, statSync, openSync, readSync, closeSync, rmSync, renameSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
+import { realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import * as L from "@luca-network/spr";
 
-export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.2" };
+export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.3" };
 const RECORD_SCHEMA = "luca.record/0.7";   // SPR section 6; the hosted service seals the same schema
 const INTENT_SCHEMA = "luca.intent/0.1";
 const CLOCK_SKEW_MS = 2 * 60_000;
@@ -51,11 +53,36 @@ const FILES = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jso
 // run twice). Each write takes book.lock, reads what the others appended since, writes, and lets go.
 const LOCK_WAIT_MS = 10_000;
 const LOCK_STALE_MS = 30_000;
+const BUSY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 const SLEEP = new Int32Array(new SharedArrayBuffer(4));
 const paymentKey = (p) => `${p.entity}:${p.rail}:${p.source.id}`;
 // What one import to Luca takes at most; a bigger book is sent in parts.
 export const PART_MAX_RECORDS = 4000;
 export const PART_MAX_BYTES = 8 * 1024 * 1024;
+
+// The published test keys of the vectors (RFC 8032 test keys 1 and 2). Anyone has their private parts.
+const TEST_KEY_IDS = new Set(["ed25519:a00579fb9f411e66", "ed25519:df45109f9d243cdb"]);
+// Folders that sync to the cloud: a book there uploads its private key, and its lock does not hold across machines.
+const SYNCED = /^(onedrive( - .+)?|dropbox|google drive|my drive|icloud drive|iclouddrive|mobile documents|cloudstorage|box|box sync|pclouddrive|mega)$/i;
+export function syncedFolderOf(dir) {
+  let p; try { p = realpathSync(dir); } catch { p = resolve(dir); }
+  for (const v of ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]) {
+    const root = process.env[v];
+    if (root && (p === root || p.toLowerCase().startsWith(resolve(root).toLowerCase() + sep))) return root;
+  }
+  return p.split(/[\\/]/).find((seg) => SYNCED.test(seg)) ?? null;
+}
+// The private key file is the owner's alone: 0600 where the system honours it, and on Windows an access list that
+// names only the current user. An existing key file others can read is reported.
+function protectKeyFile(file) {
+  if (process.platform !== "win32") return;
+  try { execFileSync("icacls", [file, "/inheritance:r", "/grant:r", `${process.env.USERNAME}:F`], { stdio: "ignore", windowsHide: true }); }
+  catch { console.warn(`SPR: could not limit ${file} to your user alone; check who can read it`); }
+}
+function warnIfOpen(file) {
+  if (process.platform === "win32") return;
+  try { if (statSync(file).mode & 0o077) console.warn(`SPR: ${file} can be read by other users of this computer. Run: chmod 600 "${file}"`); } catch {}
+}
 
 export class SprBook {
   constructor(cfg) {
@@ -64,18 +91,23 @@ export class SprBook {
     this.cfg = { timeZone: "UTC", binding: false, now: () => new Date(), owner: null, producer: SDK_PRODUCER, ...cfg };
     this.dir = cfg.dir;
     mkdirSync(this.dir, { recursive: true });
+    const synced = syncedFolderOf(this.dir);
+    if (synced && !cfg.allowSyncedFolder && process.env.SPR_ALLOW_SYNCED_FOLDER !== "1")
+      throw new Error(`The book's folder ${this.dir} is inside ${synced}, which syncs to the cloud: the private key would be uploaded, and two machines syncing one book would not see each other's lock. Choose a folder outside it, or pass allowSyncedFolder: true (SPR_ALLOW_SYNCED_FOLDER=1) if you accept that.`);
     this.keyFile = cfg.key ? null : join(this.dir, "key.pem");
     this.lockDepth = 0;
     this.reset();
     this.locked(() => {
       if (cfg.key) this.key = typeof cfg.key === "string" ? createPrivateKey(cfg.key) : cfg.key;
-      else if (existsSync(this.keyFile)) this.key = createPrivateKey(readFileSync(this.keyFile, "utf8"));
+      else if (existsSync(this.keyFile)) { warnIfOpen(this.keyFile); this.key = createPrivateKey(readFileSync(this.keyFile, "utf8")); }
       else {
         this.key = generateKeyPairSync("ed25519").privateKey;
         writeFileSync(this.keyFile, this.key.export({ type: "pkcs8", format: "pem" }).toString(), { mode: 0o600 });
+        protectKeyFile(this.keyFile);
       }
       if (this.key.asymmetricKeyType !== "ed25519") throw new Error("The book's key must be Ed25519");
       this.keyId = L.keyIdFor(this.key);
+      if (TEST_KEY_IDS.has(this.keyId)) throw new Error(`Key ${this.keyId} is a published test key from the SPR vectors; anyone can sign with it. Use a key of your own`);
       this.checkNotRetired();
       if (!this.keyring.has(this.keyId))
         this.append("keys.jsonl", { key_id: this.keyId, algorithm: "ed25519", public_pem: L.publicKeyPemOf(this.key), created_at: iso(this.now()), owner: this.cfg.entity });
@@ -125,8 +157,9 @@ export class SprBook {
     for (;;) {
       try { writeFileSync(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { flag: "wx" }); break; }
       catch (e) {
-        if (e.code !== "EEXIST") throw e;
-        try { if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) { rmSync(lock, { force: true }); continue; } } catch { continue; }
+        // On Windows a lock another process is letting go of can refuse the open with EPERM or EACCES for a moment.
+        if (e.code !== "EEXIST" && !(BUSY_CODES.has(e.code) && Date.now() <= deadline)) throw e;
+        try { if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) { rmSync(lock, { force: true }); continue; } } catch { Atomics.wait(SLEEP, 0, 0, 5); continue; }
         if (Date.now() > deadline) throw new Error(`The book at ${this.dir} is busy: another process has held book.lock for over ${LOCK_WAIT_MS / 1000} seconds. If no other process is using the book, delete book.lock.`);
         Atomics.wait(SLEEP, 0, 0, 20);
       }
@@ -136,7 +169,7 @@ export class SprBook {
       this.refresh();
       if (this.key) this.checkNotRetired();
       return fn();
-    } finally { this.lockDepth = 0; rmSync(lock, { force: true }); }
+    } finally { this.lockDepth = 0; rmSync(lock, { force: true, maxRetries: 50, retryDelay: 20 }); }
   }
   // Another process may have rotated the key: pick up the new key from key.pem, or stop if the key was passed in.
   checkNotRetired() {
@@ -454,7 +487,12 @@ export class SprBook {
   }
 
   // A copy of the book for an auditor, a counterparty or Luca: the files and a sealed manifest of their hashes.
-  exportPackage(outDir) {
+  // An export never goes into the book's own folder, and never replaces an earlier export unless asked (overwrite).
+  exportPackage(outDir, opts = {}) {
+    const out = resolve(outDir);
+    if (out === resolve(this.dir)) throw new Error("Export to a folder of its own, outside the book's folder, which holds the private key");
+    if (existsSync(out) && !opts.overwrite && L.PACKAGE_FILES.some((n) => existsSync(join(out, n))))
+      throw new Error(`${outDir} already holds an export; choose another folder, or pass overwrite: true to replace it`);
     mkdirSync(outDir, { recursive: true });
     const files = this.packageFiles();
     for (const [n, text] of Object.entries(files)) writeFileSync(join(outDir, n), text);
@@ -474,8 +512,10 @@ export class SprBook {
       const handover = { schema: "luca.key-rotation/0.1", from: this.keyId, to: L.keyIdFor(next), to_public_pem: L.publicKeyPemOf(next),
         at: iso(this.now()), entity: this.cfg.entity, ...(opts.reason ? { reason: String(opts.reason) } : {}) };
       if (handover.to === handover.from) throw new Error("The new key is the key the book already has");
+      if (TEST_KEY_IDS.has(handover.to)) throw new Error(`Key ${handover.to} is a published test key from the SPR vectors; use a key of your own`);
       if (this.keyFile) {
         writeFileSync(this.keyFile + ".new", next.export({ type: "pkcs8", format: "pem" }).toString(), { mode: 0o600 });
+        protectKeyFile(this.keyFile + ".new");
         renameSync(this.keyFile + ".new", this.keyFile);
       }
       this.append("keys.jsonl", { key_id: handover.to, algorithm: "ed25519", public_pem: handover.to_public_pem, created_at: handover.at,
@@ -497,7 +537,7 @@ export class SprBook {
     for (const files of parts) results.push(await lucaCall(opts, "/v1/spr/import", { files }));
     const sum = (k) => results.reduce((t, r) => t + (r[k] ?? 0), 0);
     return { parts: results.length, created: sum("created"), versioned: sum("versioned"), unchanged: sum("unchanged"),
-      read_from_rail: sum("read_from_rail"), differs_from_rail: sum("differs_from_rail"), results };
+      read_from_rail: sum("read_from_rail"), differs_from_rail: sum("differs_from_rail"), held_for_key_approval: sum("held_for_key_approval"), results };
   }
   // Asks Luca to accept this book's key for one of the company's entities, with a finance user's key.
   // agentOnly limits the key to this book's agent.
@@ -508,12 +548,29 @@ export class SprBook {
   }
 }
 
+// The book and the API key go to Luca only over HTTPS. Plain HTTP is allowed to this computer alone, and only when
+// asked for (allowInsecureLocal, or LUCA_ALLOW_INSECURE_LOCAL=1), for local development. Redirects are refused, so
+// the key is never sent on to another address.
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
+export function lucaUrl(url, path, opts = {}) {
+  let u;
+  try { u = new URL(path, url); } catch { throw new Error(`Luca's address is not a URL: ${url}`); }
+  if (u.protocol === "https:") return u;
+  const local = u.protocol === "http:" && LOOPBACK.has(u.hostname);
+  if (local && (opts.allowInsecureLocal || process.env.LUCA_ALLOW_INSECURE_LOCAL === "1")) return u;
+  throw new Error(local
+    ? `Refusing to send the book and the API key over plain HTTP to ${u.host}. For local development only, set LUCA_ALLOW_INSECURE_LOCAL=1 or pass allowInsecureLocal: true`
+    : `Luca's address must start with https:// (got ${u.protocol}//${u.host}): the book and the API key are never sent unencrypted`);
+}
 async function lucaCall(opts, path, body) {
   const url = opts.url ?? process.env.LUCA_URL;
   const apiKey = opts.apiKey ?? process.env.LUCA_API_KEY;
   if (!url || !apiKey) throw new Error("Give Luca's address and an API key: { url, apiKey }, or LUCA_URL and LUCA_API_KEY");
-  const res = await (opts.fetch ?? globalThis.fetch)(new URL(path, url).toString(), {
+  const target = lucaUrl(url, path, opts);
+  const res = await (opts.fetch ?? globalThis.fetch)(target.toString(), { redirect: "manual",
     method: "POST", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+  if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400))
+    throw Object.assign(new Error("Luca's address answered with a redirect; refused, so the book and the API key are not sent on"), { status: res.status });
   const out = await res.json().catch(() => ({}));
   if (!res.ok) throw Object.assign(new Error(out?.error ?? `Luca answered ${res.status}`), { status: res.status, detail: out });
   return out;

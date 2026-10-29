@@ -188,13 +188,17 @@ A package is a folder of files that can be checked with nothing but this format.
 
 A checker of a package MUST check:
 
+- that the manifest names only files from the table above, by their plain names. A checker MUST NOT read anything outside the package's folder, follow a link, or accept a name with a path in it;
 - the manifest's seal, and that each file listed has the hash the manifest gives;
 - every key handover in `keys.jsonl` (section 3);
 - every intent and record seal, with the key it names;
 - the core fields of every intent and record;
 - that every superseded version is in the package;
 - that each record's intent is in the package with the hash the record names;
-- for a record whose consent check carries a nonce, that it is marked bound exactly when the nonce equals the intent nonce (section 5).
+- for a record whose consent check carries a nonce, that it is marked bound exactly when the nonce equals the intent nonce (section 5);
+- that no record ID holds two different records, and that no payment has two records with the same version number.
+
+**Whose package it is.** The checks above use the keys the package carries, so they show the package is consistent: anyone can make a consistent package with a key of their own. A checker given the company's public keys, from the company itself, MUST also check that every seal is by one of them or by a key one of them handed over to (section 3). A checker SHOULD show which keys sealed the package, and MUST NOT present a result without the company's keys as proof of who made it.
 
 A large book MAY be sent as several packages. Each one stands on its own: it holds the keys, every version of each payment it carries, and the intents and withdrawals those records name. Its manifest says which part it is, as `part: { index, of }`.
 

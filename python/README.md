@@ -30,7 +30,7 @@ out = book.export_package("books-export")   # out["verified"] is True: the expor
 ```
 
 ```
-python -m spr books-export        # every seal, file hash and intent link; exits 1 on any failure
+python -m spr books-export --key company-public-key.pem   # every seal, file hash and intent link, and whose package it is
 python -m spr --vectors           # this package against the format's test vectors
 ```
 
@@ -43,6 +43,6 @@ book.register_with_luca("acme-us", url="https://sandbox.luca.network", api_key=F
 book.send_to_luca(url="https://sandbox.luca.network", api_key=LUCA_API_KEY)                    # sending it again changes nothing
 ```
 
-`url` and `api_key` default to `LUCA_URL` and `LUCA_API_KEY`. Only the package's files are sent, never the private key. A book over one import's limits (4,000 records or 8 MB) goes in parts, each of which checks on its own.
+`url` and `api_key` default to `LUCA_URL` and `LUCA_API_KEY`. The address must be https, and a redirect is refused; `LUCA_ALLOW_INSECURE_LOCAL=1` allows plain HTTP to your own computer, for development. A book folder inside OneDrive, Dropbox, iCloud or Google Drive is refused unless you pass `allow_synced_folder=True`. Only the package's files are sent, never the private key. A book over one import's limits (4,000 records or 8 MB) goes in parts, each of which checks on its own.
 
 Tests: `python -m unittest discover -s tests`, from this folder.

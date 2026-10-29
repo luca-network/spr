@@ -2,6 +2,28 @@
 
 Versions apply to all four packages together: `@luca-network/spr`, `@luca-network/spr-sdk`, `@luca-network/spr-mcp` and `spr-sdk` for Python. The format is draft 1 throughout (`spr/draft-1`); a book written by any of these versions opens in any other.
 
+## 0.1.3 (28 October 2026)
+
+Fixes from an independent security review of 0.1.1. Upgrade.
+
+**Changed: check these when upgrading from 0.1.2**
+- **Whose package it is.** `spr-verify <folder> --key <company public key or key ID>` (Python: `python -m spr <folder> --key ...`; libraries: `verifyPackage(read, { expectedKeys })`, `verify_package(read, expected_keys)`) checks that every seal is by the company's key or a key it handed over to, and fails any other signer. Without `--key` the result now ends "consistency only", and the answer carries `trust` and `signers`.
+- **The checker stays inside the package.** A manifest may name only the package's own files, by plain name. Paths, `..`, drive letters and links are refused, in both languages. Before, a crafted manifest could make the checker read a file outside the folder.
+- **Two records under one ID fail.** A package holding one record ID with two different contents, or two records of one payment with the same version, now fails the check. New vectors cover it.
+- **HTTPS only.** `sendToLuca` and `registerWithLuca` refuse an address that is not https, and refuse redirects. Plain HTTP to your own computer is allowed only with `LUCA_ALLOW_INSECURE_LOCAL=1`.
+- **MCP exports stay in one place.** `export_package` takes a folder `name` and writes under the export folder (`SPR_EXPORT_DIR`, or `exports` inside the book). It no longer takes a path, and does not replace an earlier export unless `overwrite` is true. `book.exportPackage()` also refuses to replace an earlier export without `{ overwrite: true }`, and refuses the book's own folder.
+- **Synced folders refused.** A book folder inside OneDrive, Dropbox, iCloud or Google Drive is refused unless `allowSyncedFolder: true` (Python: `allow_synced_folder=True`, or `SPR_ALLOW_SYNCED_FOLDER=1`), because the private key would be uploaded and the lock does not hold across machines.
+
+**New**
+- On Windows, several processes sharing one book no longer fail while one of them lets go of `book.lock`. The tests now run on Windows and macOS as well as Linux.
+- On Windows the key file's access list is limited to the current user. Elsewhere, a key file other users can read is reported.
+- The vectors' published test keys are refused for sealing.
+- The package check also checks the seals of withdrawals and pre-payment checks.
+- The MCP tools say which only read, which reach outside (send_to_luca), and that purposes, counterparties and memos are data, never instructions.
+- Python needs `cryptography` 44 or later.
+- `SECURITY.md`: how to report a security problem.
+- The workflows pin every GitHub Action to a commit, and Dependabot proposes updates.
+
 ## 0.1.2 (28 October 2026)
 
 **New**

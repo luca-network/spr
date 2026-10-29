@@ -68,12 +68,14 @@ const out = book.exportPackage("./books-export");
 out.verified;   // true: the export checked itself before returning
 ```
 
-Anyone can then check it with no Luca code, in either language:
+Anyone can then check it with no Luca code, in either language. Give the checker the company's public key, obtained from the company and never from the package, to check whose package it is:
 
 ```
-npx spr-verify ./books-export
-python -m spr ./books-export
+npx spr-verify ./books-export --key company-public-key.pem     # or --key ed25519:<key ID>
+python -m spr ./books-export --key company-public-key.pem
 ```
+
+`book.publicKey()` gives the key to hand out. Without `--key`, the result ends "consistency only": the package agrees with the keys it carries, which anyone can arrange with a key of their own.
 
 For a book with one intent and one payment bound to it:
 
@@ -91,7 +93,7 @@ For a book with one intent and one payment bound to it:
   PASS  record LR-X402-79F5ABBB13-v1: it names the intent's sealed hash
   PASS  record LR-X402-79F5ABBB13-v1: bound only when the nonce is the intent's fingerprint
 
-12 passed, 0 failed
+12 passed, 0 failed · verified against the company key you gave
 ```
 
 Change one byte of a record and the same command reports `FAIL` for that record's seal and for the file's hash in the manifest, and exits with code 1. Pointed at the book's own folder, the checkers check every seal and say to share an export instead.
@@ -109,11 +111,11 @@ const sent = await book.sendToLuca({ url: "https://sandbox.luca.network", apiKey
 sent.created; sent.versioned; sent.unchanged;
 ```
 
-`url` and `apiKey` default to `LUCA_URL` and `LUCA_API_KEY`. Only the package's files are sent, never the private key. A book over one import's limits (4,000 records or 8 MB) goes in parts, each of which checks on its own; the answer then says how many parts went and adds up their counts.
+`url` and `apiKey` default to `LUCA_URL` and `LUCA_API_KEY`. The address must be https: the book and the key are never sent unencrypted, and a redirect is refused. For a Luca running on your own computer during development, set `LUCA_ALLOW_INSECURE_LOCAL=1`. Only the package's files are sent, never the private key. A book over one import's limits (4,000 records or 8 MB) goes in parts, each of which checks on its own; the answer then says how many parts went and adds up their counts.
 
 ## Keys
 
-By default the book creates an Ed25519 key in its folder, readable only by its owner. Pass `key` to use one from your operating system's keychain or secrets manager instead. Keep the folder out of source control.
+By default the book creates an Ed25519 key in its folder, readable only by its owner (on Windows, the file's access list names only you). Pass `key` to use one from your operating system's keychain or secrets manager instead. Keep the folder out of source control. A folder inside OneDrive, Dropbox, iCloud or Google Drive is refused, because the key would be uploaded; pass `allowSyncedFolder: true` only if you accept that. The vectors' published test keys are refused.
 
 To replace the key, call `book.rotateKey({ reason })`. The book seals a handover with the old key, adds the new public key to `keys.jsonl`, and seals from then on with the new key. Records sealed before stay checkable with the old public key. If Luca keeps the book, the next send registers the new key through the handover. If you passed the key in, pass the new one too: `book.rotateKey({ key })`.
 

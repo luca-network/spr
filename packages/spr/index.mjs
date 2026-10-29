@@ -256,39 +256,80 @@ export function checkKeyHandover(row, keys) {
 }
 
 // ---- 9. a local package ----------------------------------------------------------------------------------
+// The only files a package holds (section 8). A manifest that names anything else is refused, so a package can
+// never send a checker outside its own folder.
+export const PACKAGE_FILES = ["manifest.json", "keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"];
+const isKeyId = (k) => typeof k === "string" && /^ed25519:[0-9a-f]{16}$/.test(k);
+
+// Problems in a set of records as a whole: one record ID with two different contents, or two records of one
+// payment with the same version number. Either means two writers sealed different facts (section 6).
+export function checkRecordSet(payloads) {
+  const problems = [], byId = new Map(), byVersion = new Map();
+  for (const p of payloads) {
+    const h = payloadSha256(p);
+    const seen = byId.get(p?.record_id);
+    if (seen !== undefined && seen !== h) problems.push(`record ${p.record_id} appears twice with different content`);
+    byId.set(p?.record_id, h);
+    const k = `${p?.entity}|${p?.rail}|${p?.source?.id}|${p?.version}`;
+    const other = byVersion.get(k);
+    if (other && other.id !== p?.record_id) problems.push(`payment ${p?.source?.id} on ${p?.rail} has two version ${p?.version} records: ${other.id} and ${p?.record_id}`);
+    else if (!other) byVersion.set(k, { id: p?.record_id });
+  }
+  return { ok: problems.length === 0, problems };
+}
+
 // A folder (or a map of file name to bytes) holding keys.jsonl, intents.jsonl, records.jsonl and a sealed
 // manifest.json, as the SDKs export it. Returns every check made, and ok when all pass.
 // A book's own folder holds its private key (key.pem) and no manifest: it is checked as a book, every seal and
 // core field, and the answer says to export it before sharing. A package that holds a private key fails.
-export function verifyPackage(read) {
+//
+// Whose package it is: without opts.expectedKeys the check shows the package is consistent with the keys it carries,
+// and says so (trust: "consistency-only"). With the company's public keys or key IDs, every seal must come from one
+// of them, or from a key one of them handed over to (trust: "expected-key"); any other signer fails.
+export function verifyPackage(read, opts = {}) {
   const results = [];
   const check = (what, ok, detail = "") => { results.push({ what, ok: Boolean(ok), detail }); return ok; };
-  const jsonl = (name) => { const b = read(name); return b ? b.toString("utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l)) : []; };
-  const holdsKey = Boolean(read("key.pem"));
-  const kind = holdsKey && !read("manifest.json") ? "book" : "package";
+  const cache = new Map();
+  const get = (name) => {
+    if (!cache.has(name)) {
+      try { cache.set(name, read(name)); } catch (e) { check(`${name} can be read`, false, String(e?.message ?? e)); cache.set(name, null); }
+    }
+    return cache.get(name);
+  };
+  const jsonl = (name) => { const b = get(name); return b ? b.toString("utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l)) : []; };
+  const holdsKey = Boolean(get("key.pem"));
+  const kind = holdsKey && !get("manifest.json") ? "book" : "package";
   if (kind === "book") check("this is a book's own folder: its seals and fields are checked below; it holds the private key, so share an export of it instead", true);
   else if (holdsKey) check("the package holds no private key", false, "key.pem is a private key and must never be shared");
   const keys = new Map(jsonl("keys.jsonl").map((k) => [k.key_id, k]));
+  const signers = new Set();
   const sealOk = (payload, seal) => {
     const s = normalizeSeal(seal ?? {});
+    signers.add(s.key_id);
     const k = keys.get(s.key_id);
     if (!k) return { ok: false, detail: `key ${s.key_id} is not in keys.jsonl` };
     const v = verifySeal(payload, s, k.public_pem, k.algorithm ?? s.algorithm);
     return { ok: v.ok, detail: v.ok ? "" : !v.hash_matches ? "the payload's hash is not the sealed hash" : "the signature does not verify with that key" };
   };
   // A key handed over from an earlier one carries the handover, sealed by the earlier key (section 3).
+  const goodHandover = new Set();
   for (const k of keys.values()) {
     if (!k.rotation) continue;
     const c = checkKeyHandover(k, keys);
+    if (c.ok) goodHandover.add(k.key_id);
     check(`key ${k.key_id} was handed over by key ${k.rotation.payload?.from}, which sealed the handover`, c.ok, c.detail);
   }
-  const manifestBytes = read("manifest.json");
+  const manifestBytes = get("manifest.json");
   if (kind === "package" && check("manifest.json is present", Boolean(manifestBytes))) {
     const m = JSON.parse(manifestBytes.toString("utf8"));
     const s = sealOk(m.package, m.seal);
     check("the manifest is sealed", s.ok, s.detail);
     for (const f of m.package?.files ?? []) {
-      const b = read(f.name);
+      if (typeof f?.name !== "string" || !PACKAGE_FILES.includes(f.name) || f.name === "manifest.json") {
+        check("the manifest names only the package's own files", false, `${JSON.stringify(f?.name)} is not one of ${PACKAGE_FILES.slice(1).join(", ")}`);
+        continue;
+      }
+      const b = get(f.name);
       check(`${f.name} is the file the manifest names`, Boolean(b) && sha256Hex(b) === f.sha256, b ? "its SHA-256 differs" : "missing");
     }
   }
@@ -301,6 +342,11 @@ export function verifyPackage(read) {
     check(`intent ${i.payload?.intent_id} has the core fields`, c.ok, c.problems.join("; "));
     intentById.set(i.payload?.intent_id, i);
   }
+  for (const name of ["cancellations.jsonl", "checks.jsonl"])
+    for (const row of jsonl(name)) {
+      const s = sealOk(row.payload, row.seal);
+      check(`${name === "checks.jsonl" ? "pre-payment check" : "withdrawal of intent"} ${row.payload?.id ?? row.payload?.intent_id} is sealed`, s.ok, s.detail);
+    }
   const recById = new Map(records.map((r) => [r.payload?.record_id, r]));
   for (const r of records) {
     const p = r.payload ?? {};
@@ -320,5 +366,23 @@ export function verifyPackage(read) {
       }
     }
   }
-  return { kind, ok: results.every((r) => r.ok), passed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
+  const set = checkRecordSet(records.map((r) => r.payload ?? {}));
+  check("no record ID holds two different records, and no payment has two records of one version", set.ok, set.problems.join("; "));
+
+  // Whose package it is.
+  const expected = (opts.expectedKeys ?? []).map((k) => isKeyId(k) ? k : keyIdFor(k));
+  let trust = "consistency-only";
+  if (expected.length) {
+    const trusted = new Set(expected);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const id of goodHandover) if (!trusted.has(id) && trusted.has(keys.get(id).rotation.payload.from)) { trusted.add(id); grew = true; }
+    }
+    const strangers = [...signers].filter((id) => !trusted.has(id));
+    trust = check(`every seal is by the company's expected key ${expected.join(" or ")}, or a key it handed over to`, strangers.length === 0,
+      strangers.length ? `sealed by ${strangers.join(", ")}, which the expected key did not hand over to` : "") ? "expected-key" : "untrusted";
+  }
+  const ok = results.every((r) => r.ok);
+  return { kind, ok, trust, signers: [...signers], expected_keys: expected,
+    passed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
 }
