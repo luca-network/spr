@@ -297,10 +297,13 @@ test("a large book: sealing stays quick, and it goes to Luca in parts that each 
   try {
     const book = new SprBook({ dir, agentId: "agt_big", entity: "Example Co" });
     const i = book.declare({ purpose: "Bulk data", max_amount_minor: 10_000_000, currency: "USD", expires_in: "P3D" });
-    for (let k = 0; k < 3000; k++) book.seal({ rail: "stripe", source_id: `pi_${k}`, amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00Z", intent_id: k % 2 ? i.intent_id : undefined });
-    const t = Date.now();
-    for (let k = 0; k < 200; k++) book.seal({ rail: "stripe", source_id: `pi_late_${k}`, amount_minor: 1, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" });
-    assert.ok(Date.now() - t < 2000, `200 seals into a 3,000-record book took ${Date.now() - t} ms`);
+    // The same machine seals 200 into a nearly empty book, then 200 into the 3,000-record book: a slow or busy
+    // computer slows both, so only a cost that grows with the book fails.
+    const timed = (tag) => { const t = Date.now(); for (let k = 0; k < 200; k++) book.seal({ rail: "stripe", source_id: `pi_${tag}_${k}`, amount_minor: 1, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" }); return Date.now() - t; };
+    const early = timed("early");
+    for (let k = 0; k < 2800; k++) book.seal({ rail: "stripe", source_id: `pi_${k}`, amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00Z", intent_id: k % 2 ? i.intent_id : undefined });
+    const late = timed("late");
+    assert.ok(late < early * 3 + 250, `200 seals took ${early} ms into a nearly empty book and ${late} ms into a 3,000-record book`);
     const parts = book.packageParts({ maxRecords: 1000 });
     assert.equal(parts.length, 4);
     for (const p of parts) assert.equal(spr.verifyPackage((n) => p[n] === undefined ? null : Buffer.from(p[n])).ok, true);

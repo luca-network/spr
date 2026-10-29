@@ -293,6 +293,12 @@ class GroupOne(unittest.TestCase):
             self.assertFalse(out2["ok"])
             self.assertTrue(any("is a link" in r["detail"] for r in out2["results"]))
 
+    def test_unknown_time_zone_is_refused_when_the_book_opens(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                SprBook(dir=d, agent_id="agt", entity="Example Co", time_zone="Mars/Olympus")
+            self.assertEqual(SprBook(dir=d, agent_id="agt", entity="Example Co", time_zone="Europe/London").time_zone, "Europe/London")
+
     def test_synced_folders_test_keys_and_exports(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(ValueError):

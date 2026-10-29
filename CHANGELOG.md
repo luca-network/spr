@@ -15,6 +15,7 @@ Fixes from an independent security review of 0.1.1. Upgrade.
 - **Synced folders refused.** A book folder inside OneDrive, Dropbox, iCloud or Google Drive is refused unless `allowSyncedFolder: true` (Python: `allow_synced_folder=True`, or `SPR_ALLOW_SYNCED_FOLDER=1`), because the private key would be uploaded and the lock does not hold across machines.
 
 **New**
+- On Windows the Python SDK installs `tzdata`, because Windows has no time-zone database of its own; without it a book could not work out its accounting date. An unknown time zone is now refused when the book opens, with the reason.
 - On Windows, several processes sharing one book no longer fail while one of them lets go of `book.lock`. The tests now run on Windows and macOS as well as Linux.
 - On Windows the key file's access list is limited to the current user. Elsewhere, a key file other users can read is reported.
 - The vectors' published test keys are refused for sealing.

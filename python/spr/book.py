@@ -76,6 +76,17 @@ def _warn_if_open(path: str):
         pass
 
 
+def _zone_for(name: str):
+    """The book's time zone. Windows has no time-zone database of its own; Python then reads the tzdata package."""
+    if name in ("UTC", "Etc/UTC", "Z"):
+        return timezone.utc
+    try:
+        return ZoneInfo(name)
+    except Exception as e:
+        hint = " Windows has no time-zone database of its own: run pip install tzdata." if os.name == "nt" else ""
+        raise ValueError(f"Unknown time zone {name!r}; use an IANA name such as 'America/Los_Angeles'.{hint}") from e
+
+
 def _payment_key(p):
     return f"{p['entity']}:{p['rail']}:{p['source']['id']}"
 
@@ -142,6 +153,7 @@ class SprBook:
             raise ValueError("The book needs the agent's ID (agent_id) and the company it pays for (entity)")
         self.dir, self.agent_id, self.entity, self.owner = dir, agent_id, entity, owner
         self.time_zone, self.binding, self._now = time_zone, binding, now or (lambda: datetime.now(timezone.utc))
+        self._zone = _zone_for(time_zone)
         self.producer = producer or SDK_PRODUCER
         os.makedirs(dir, exist_ok=True)
         synced = synced_folder_of(dir)
@@ -308,7 +320,7 @@ class SprBook:
             return json.load(f)
 
     def _local_date(self, at: datetime) -> str:
-        return at.astimezone(ZoneInfo(self.time_zone)).strftime("%Y-%m-%d")
+        return at.astimezone(self._zone).strftime("%Y-%m-%d")
 
     def _mandate_checks(self, amount, currency, at):
         m = self._mandate()
