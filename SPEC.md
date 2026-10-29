@@ -56,6 +56,20 @@ A sealed object travels as `{ "payload": …, "seal": … }`. Luca's own exports
 
 The public keys of a company are published as a list of `{ key_id, algorithm, public_pem }`, including retired keys, so old records stay checkable.
 
+**Handing over to a new key.** A company that replaces its key adds the new key to the list with a `rotation` member: `{ payload, seal }`, where the payload is
+
+| Member | Meaning |
+|---|---|
+| `schema` | `luca.key-rotation/0.1` |
+| `from` | the key ID of the key handed over from |
+| `to` | the key ID of the new key |
+| `to_public_pem` | the new public key |
+| `at` | when, an ISO 8601 instant |
+| `entity` | the company |
+| `reason` | optional: why |
+
+and the seal is made with the key named in `from`. A reader that trusts the earlier key MAY trust the new one on the strength of the handover. A handover is good only when its seal checks with the earlier key, `to` is the key ID of `to_public_pem`, and both match the key it is attached to. Records sealed with the earlier key stay checkable with its public key.
+
 ## 4. Merkle trees
 
 The format uses one Merkle tree construction for evidence, for a journal entry's commitment to its records and for packages.
@@ -165,7 +179,7 @@ A package is a folder of files that can be checked with nothing but this format.
 
 | File | Contents |
 |---|---|
-| `keys.jsonl` | one public key per line: `{ key_id, algorithm, public_pem }` |
+| `keys.jsonl` | one public key per line: `{ key_id, algorithm, public_pem }`, and `rotation` for a key handed over from an earlier one (section 3) |
 | `intents.jsonl` | one sealed intent per line: `{ payload, seal }` |
 | `cancellations.jsonl` | one sealed withdrawal of an intent per line |
 | `checks.jsonl` | one sealed pre-payment check per line |
@@ -175,11 +189,14 @@ A package is a folder of files that can be checked with nothing but this format.
 A checker of a package MUST check:
 
 - the manifest's seal, and that each file listed has the hash the manifest gives;
+- every key handover in `keys.jsonl` (section 3);
 - every intent and record seal, with the key it names;
 - the core fields of every intent and record;
 - that every superseded version is in the package;
 - that each record's intent is in the package with the hash the record names;
 - for a record whose consent check carries a nonce, that it is marked bound exactly when the nonce equals the intent nonce (section 5).
+
+A large book MAY be sent as several packages. Each one stands on its own: it holds the keys, every version of each payment it carries, and the intents and withdrawals those records name. Its manifest says which part it is, as `part: { index, of }`.
 
 A book's own folder also holds its private key (`key.pem` in the SDKs) and no manifest. A checker MAY check it as a book (every seal and core field, with no manifest) and SHOULD say to share an export instead. A package MUST NOT contain a private key, and a checker MUST fail one that does.
 
@@ -195,7 +212,8 @@ A **checker** conforms when it gives the answer each vector in `packages/spr/vec
 - Merkle roots and paths, and a records root;
 - intent nonces;
 - JWK thumbprints and label signatures, Ed25519 and P-256;
-- which records and intents have their core fields.
+- which records and intents have their core fields;
+- key handovers, good and bad.
 
 Run them against this library with:
 

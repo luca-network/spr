@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 books/
 *.pem
+spr-books/
+book.lock

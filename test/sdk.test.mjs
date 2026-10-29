@@ -243,3 +243,70 @@ test("authority: the book's own limits are reported as self-declared; a book's f
     assert.ok(leaked.results.some((r) => r.what === "the package holds no private key" && !r.ok));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("one writer at a time: four processes sealing into one book lose nothing and seal each payment once", async () => {
+  const { spawn } = await import("node:child_process");
+  const dir = mkdtempSync(join(tmpdir(), "spr-many-"));
+  try {
+    new SprBook({ dir, agentId: "agt_many", entity: "Example Co" });
+    const sdk = import.meta.resolve("@luca-network/spr-sdk");
+    const script = `const { SprBook } = await import(${JSON.stringify("SDK_URL")});
+      const [dir, who] = process.argv.slice(1); const b = new SprBook({ dir, agentId: "agt_many", entity: "Example Co" }); const out = {};
+      for (let k = 0; k < 60; k++) {
+        for (const [id, amt] of [[who + "-" + k, 100 + k], ["shared-" + (k % 10), who === "w0" ? 1 : 2]]) {
+          const s = b.seal({ rail: "stripe", source_id: id, amount_minor: amt, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" }).status;
+          out[s] = (out[s] ?? 0) + 1;
+        }
+      }
+      console.log(JSON.stringify(out));`.replace("SDK_URL", sdk);
+    const runs = await Promise.all(["w0", "w1", "w2", "w3"].map((w) => new Promise((done, fail) => {
+      let out = ""; const p = spawn(process.execPath, ["--input-type=module", "-e", script, dir, w]);
+      p.stdout.on("data", (d) => (out += d)); p.stderr.on("data", (d) => (out += d));
+      p.on("exit", (c) => c === 0 ? done(JSON.parse(out)) : fail(new Error(out)));
+    })));
+    const lines = readFileSync(join(dir, "records.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(lines.length, 4 * 60 + 10, JSON.stringify(runs));
+    assert.equal(new Set(lines.map((r) => r.payload.record_id)).size, lines.length);
+    const read = (n) => existsSync(join(dir, n)) ? readFileSync(join(dir, n)) : null;
+    assert.equal(spr.verifyPackage(read).ok, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("key rotation: the new key is handed over by the old one; old records still check; another open copy of the book follows the new key", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spr-rot-"));
+  try {
+    const book = new SprBook({ dir, agentId: "agt_rot", entity: "Example Co" });
+    const other = new SprBook({ dir, agentId: "agt_rot", entity: "Example Co" });
+    const r1 = book.seal({ rail: "stripe", source_id: "pi_1", amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" });
+    const r = book.rotateKey({ reason: "Yearly rotation" });
+    assert.notEqual(r.from, r.to);
+    assert.equal(book.verifyRecord(r1.record_id).ok, true);
+    const r2 = other.seal({ rail: "stripe", source_id: "pi_2", amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" });
+    assert.equal(r2.seal?.key_id, r.to, "a copy opened before the rotation seals with the new key");
+    const read = (n) => existsSync(join(dir, n)) ? readFileSync(join(dir, n)) : null;
+    const v = spr.verifyPackage(read);
+    assert.equal(v.ok, true);
+    assert.ok(v.results.some((x) => x.what === `key ${r.to} was handed over by key ${r.from}, which sealed the handover` && x.ok));
+    const forged = readFileSync(join(dir, "keys.jsonl"), "utf8").replace("Yearly rotation", "Forged");
+    assert.equal(spr.verifyPackage((n) => n === "keys.jsonl" ? Buffer.from(forged) : read(n)).ok, false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a large book: sealing stays quick, and it goes to Luca in parts that each check on their own", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spr-big-"));
+  try {
+    const book = new SprBook({ dir, agentId: "agt_big", entity: "Example Co" });
+    const i = book.declare({ purpose: "Bulk data", max_amount_minor: 10_000_000, currency: "USD", expires_in: "P3D" });
+    for (let k = 0; k < 3000; k++) book.seal({ rail: "stripe", source_id: `pi_${k}`, amount_minor: 100, currency: "USD", occurred_at: "2026-10-28T12:00:00Z", intent_id: k % 2 ? i.intent_id : undefined });
+    const t = Date.now();
+    for (let k = 0; k < 200; k++) book.seal({ rail: "stripe", source_id: `pi_late_${k}`, amount_minor: 1, currency: "USD", occurred_at: "2026-10-28T12:00:00Z" });
+    assert.ok(Date.now() - t < 2000, `200 seals into a 3,000-record book took ${Date.now() - t} ms`);
+    const parts = book.packageParts({ maxRecords: 1000 });
+    assert.equal(parts.length, 4);
+    for (const p of parts) assert.equal(spr.verifyPackage((n) => p[n] === undefined ? null : Buffer.from(p[n])).ok, true);
+    let sent = 0;
+    const fetch = async (_url, init) => { sent++; const f = JSON.parse(init.body).files; return new Response(JSON.stringify({ created: f["records.jsonl"].trim().split("\n").length }), { status: 201 }); };
+    const out = await book.sendToLuca({ url: "https://luca.example", apiKey: "k", fetch, maxRecords: 1000 });
+    assert.deepEqual([sent, out.parts, out.created], [4, 4, 3200]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

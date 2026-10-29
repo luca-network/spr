@@ -239,6 +239,22 @@ export function checkIntent(p) {
   return { ok: problems.length === 0, problems };
 }
 
+export const KEY_ROTATION_SCHEMA = "luca.key-rotation/0.1";
+// A key row that carries a handover: { key_id, public_pem, rotation: { payload, seal } }. The handover names the
+// earlier key (from) and this one (to, to_public_pem), and is sealed by the earlier key, found in keys (key_id -> row).
+export function checkKeyHandover(row, keys) {
+  const h = row?.rotation?.payload, seal = row?.rotation?.seal;
+  if (!h || !seal) return { ok: false, detail: "no handover" };
+  if (h.schema !== KEY_ROTATION_SCHEMA) return { ok: false, detail: `the handover's schema is not ${KEY_ROTATION_SCHEMA}` };
+  if (h.to !== row.key_id || h.to_public_pem !== row.public_pem || keyIdFor(row.public_pem) !== row.key_id) return { ok: false, detail: "the handover does not name this key" };
+  const s = normalizeSeal(seal);
+  if (s.key_id !== h.from || h.from === h.to) return { ok: false, detail: "the handover is not sealed by the earlier key it names" };
+  const prev = keys instanceof Map ? keys.get(h.from) : keys?.[h.from];
+  if (!prev) return { ok: false, detail: `key ${h.from} is not in the list of keys` };
+  const v = verifySeal(h, s, prev.public_pem, prev.algorithm ?? s.algorithm);
+  return { ok: v.ok, detail: v.ok ? "" : !v.hash_matches ? "the handover is not the one sealed" : "the earlier key's signature does not verify" };
+}
+
 // ---- 9. a local package ----------------------------------------------------------------------------------
 // A folder (or a map of file name to bytes) holding keys.jsonl, intents.jsonl, records.jsonl and a sealed
 // manifest.json, as the SDKs export it. Returns every check made, and ok when all pass.
@@ -260,6 +276,12 @@ export function verifyPackage(read) {
     const v = verifySeal(payload, s, k.public_pem, k.algorithm ?? s.algorithm);
     return { ok: v.ok, detail: v.ok ? "" : !v.hash_matches ? "the payload's hash is not the sealed hash" : "the signature does not verify with that key" };
   };
+  // A key handed over from an earlier one carries the handover, sealed by the earlier key (section 3).
+  for (const k of keys.values()) {
+    if (!k.rotation) continue;
+    const c = checkKeyHandover(k, keys);
+    check(`key ${k.key_id} was handed over by key ${k.rotation.payload?.from}, which sealed the handover`, c.ok, c.detail);
+  }
   const manifestBytes = read("manifest.json");
   if (kind === "package" && check("manifest.json is present", Boolean(manifestBytes))) {
     const m = JSON.parse(manifestBytes.toString("utf8"));

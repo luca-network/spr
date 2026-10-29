@@ -35,6 +35,8 @@ export interface SealResult {
 }
 export interface PaymentCheck { id: string; decision: "approve" | "decline"; authority: Authority; checks: Check[]; reasons: string[]; seal: Seal }
 export interface Label { label_id: string; record_id: string; shared: any; shared_sha256: string; sign_this: string; signatures: any[]; state?: string }
+export declare const PART_MAX_RECORDS: number;
+export declare const PART_MAX_BYTES: number;
 export declare class SprBook {
   constructor(cfg: BookConfig);
   readonly dir: string; readonly keyId: string;
@@ -56,13 +58,20 @@ export declare class SprBook {
   publicKey(): { key_id: string; public_pem: string; entity: string; agent_id: string };
   /** The book as a package: each file by name, as text, with a sealed manifest. */
   packageFiles(): Record<string, string>;
+  /** The book in parts that each stand on their own (every version of a payment in one part); one part when it fits. */
+  packageParts(opts?: PartOptions): Record<string, string>[];
+  /** A new key for the book, handed over by the old one in keys.jsonl. Records sealed before stay checkable. */
+  rotateKey(opts?: { key?: KeyObject | string; reason?: string }): { from: string; to: string; at: string; key_file: string | null; next: string };
   /** Sends the book to Luca, which checks every seal before storing anything. url and apiKey default to LUCA_URL and LUCA_API_KEY. */
   sendToLuca(opts?: LucaOptions): Promise<LucaImport>;
   /** Asks Luca to accept this book's key for an entity, with a finance user's key. */
   registerWithLuca(opts: LucaOptions & { entityId: string; agentOnly?: boolean }): Promise<{ change: { id: string; status: string } }>;
 }
-export interface LucaOptions { url?: string; apiKey?: string; fetch?: typeof fetch }
+export interface PartOptions { /** Default 4000 */ maxRecords?: number; /** Default 8 MiB */ maxBytes?: number }
+export interface LucaOptions extends PartOptions { url?: string; apiKey?: string; fetch?: typeof fetch }
 export interface LucaImport {
+  /** When the book went in parts: how many, and each part's own answer in results. */
+  parts?: number; results?: LucaImport[];
   import_id: string; package_sha256: string; entity_id: string; checks: { passed: number; failed: number };
   records_in_package: number; current_records: number; created: number; versioned: number; unchanged: number; read_from_rail: number; differs_from_rail: number;
   items: { spr_record_id: string; spr_payload_sha256: string; record_id: string | null; outcome: "created" | "versioned" | "unchanged" | "read_from_rail";

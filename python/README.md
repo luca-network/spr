@@ -19,14 +19,22 @@ record = book.seal(rail="x402", source_id=tx_hash, amount_minor=10000, currency=
 
 The folder, files and records are the same as the JavaScript SDK's, so either language opens the other's book.
 
-The book runs on your machine and makes no call to Luca. A check against the book's own `mandate.json` reports `authority: "self-declared"`, because whoever keeps the book writes it. Times need their offset; a time without one is refused. Different facts for a payment already sealed return `conflict` and seal nothing, unless you pass `correction={"reason": ...}`.
+The book runs on your machine and makes no call to Luca. It checks each payment against the agent's declared intent: the cap, the expiry, and whether the intent was withdrawn. An optional `mandate.json` in the folder adds one limit across all the agent's intents; whoever keeps the folder writes it, so results report it as `authority: "self-declared"`. Spending authority granted by someone else needs that party's own record, such as a mandate approved in Luca's hosted service.
 
-Check a package, or run the test vectors that come with the package:
+Times need their offset; a time without one is refused. Different facts for a payment already sealed return `conflict` and seal nothing, unless you pass `correction={"reason": ...}`.
+
+Export the book for an auditor or a counterparty (never share the folder itself, which holds the private key), and check it, or run the test vectors that come with the package:
+
+```python
+out = book.export_package("books-export")   # out["verified"] is True: the export checked itself
+```
 
 ```
-python -m spr <package folder>
-python -m spr --vectors
+python -m spr books-export        # every seal, file hash and intent link; exits 1 on any failure
+python -m spr --vectors           # this package against the format's test vectors
 ```
+
+`book.rotate_key(reason=...)` replaces the key: the old key seals a handover to the new one in `keys.jsonl`, and records sealed before stay checkable. Several processes can use one book: each write takes `book.lock` for a moment, so nothing is lost.
 
 Send the book to Luca's hosted service (optional), which checks every seal, then classifies each payment and posts it to your ERP:
 
@@ -35,6 +43,6 @@ book.register_with_luca("acme-us", url="https://sandbox.luca.network", api_key=F
 book.send_to_luca(url="https://sandbox.luca.network", api_key=LUCA_API_KEY)                    # sending it again changes nothing
 ```
 
-`url` and `api_key` default to `LUCA_URL` and `LUCA_API_KEY`. Only the package's files are sent, never the private key.
+`url` and `api_key` default to `LUCA_URL` and `LUCA_API_KEY`. Only the package's files are sent, never the private key. A book over one import's limits (4,000 records or 8 MB) goes in parts, each of which checks on its own.
 
 Tests: `python -m unittest discover -s tests`, from this folder.

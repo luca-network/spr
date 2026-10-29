@@ -63,5 +63,9 @@ export function runVectors(v) {
     const c = L.checkIntent(r.payload);
     check(`intent core fields: ${r.name}`, c.ok === r.ok, c.problems.join("; ") || "it passed");
   }
+  for (const k of v.key_handovers ?? []) {
+    const c = L.checkKeyHandover(k.key, new Map(k.keys.map((x) => [x.key_id, x])));
+    check(`key handover: ${k.name}`, c.ok === k.ok, c.detail || "it passed");
+  }
   return { spec: v.spec, passed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
 }

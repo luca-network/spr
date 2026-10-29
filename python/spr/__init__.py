@@ -9,4 +9,4 @@ from .format import *  # noqa: F401,F403
 from .format import SPEC_VERSION, run_vectors, verify_package  # noqa: F401
 from .book import SprBook, SDK_PRODUCER, LucaError, verify_folder  # noqa: F401
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

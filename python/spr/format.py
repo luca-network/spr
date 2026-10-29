@@ -346,6 +346,29 @@ def check_intent(p: Any) -> dict:
 
 
 # ---- 9. a package ----------------------------------------------------------------------------------------
+KEY_ROTATION_SCHEMA = "luca.key-rotation/0.1"
+
+
+def check_key_handover(row: dict, keys: dict) -> dict:
+    """A key row that carries a handover, sealed by the earlier key it names, found in keys (key_id -> row)."""
+    rot = (row or {}).get("rotation") or {}
+    h, seal = rot.get("payload"), rot.get("seal")
+    if not h or not seal:
+        return {"ok": False, "detail": "no handover"}
+    if h.get("schema") != KEY_ROTATION_SCHEMA:
+        return {"ok": False, "detail": f"the handover's schema is not {KEY_ROTATION_SCHEMA}"}
+    if h.get("to") != row.get("key_id") or h.get("to_public_pem") != row.get("public_pem") or key_id_for(row["public_pem"]) != row["key_id"]:
+        return {"ok": False, "detail": "the handover does not name this key"}
+    s = normalize_seal(seal)
+    if s["key_id"] != h.get("from") or h.get("from") == h.get("to"):
+        return {"ok": False, "detail": "the handover is not sealed by the earlier key it names"}
+    prev = keys.get(h["from"])
+    if not prev:
+        return {"ok": False, "detail": f"key {h['from']} is not in the list of keys"}
+    v = verify_seal(h, s, prev["public_pem"], prev.get("algorithm") or s["algorithm"])
+    return {"ok": v["ok"], "detail": "" if v["ok"] else "the handover is not the one sealed" if not v["hash_matches"] else "the earlier key's signature does not verify"}
+
+
 def verify_package(read: Callable[[str], Optional[bytes]]) -> dict:
     results = []
     def check(what, ok, detail=""):
@@ -368,6 +391,12 @@ def verify_package(read: Callable[[str], Optional[bytes]]) -> dict:
             return False, f"key {s['key_id']} is not in keys.jsonl"
         v = verify_seal(payload, s, k["public_pem"], k.get("algorithm") or s["algorithm"])
         return v["ok"], "" if v["ok"] else ("the payload's hash is not the sealed hash" if not v["hash_matches"] else "the signature does not verify with that key")
+    # A key handed over from an earlier one carries the handover, sealed by the earlier key (section 3).
+    for k in keys.values():
+        if not k.get("rotation"):
+            continue
+        c = check_key_handover(k, keys)
+        check(f"key {k['key_id']} was handed over by key {(k['rotation'].get('payload') or {}).get('from')}, which sealed the handover", c["ok"], c["detail"])
     mb = read("manifest.json")
     if kind == "package" and check("manifest.json is present", bool(mb)):
         m = json.loads(mb.decode("utf-8"))
@@ -461,5 +490,8 @@ def run_vectors(v: dict) -> dict:
     for r in v["intents"]:
         c = check_intent(r["payload"])
         check(f"intent core fields: {r['name']}", c["ok"] == r["ok"], "; ".join(c["problems"]) or "it passed")
+    for k in v.get("key_handovers", []):
+        c = check_key_handover(k["key"], {x["key_id"]: x for x in k["keys"]})
+        check(f"key handover: {k['name']}", c["ok"] == k["ok"], c["detail"] or "it passed")
     failed = sum(1 for r in results if not r["ok"])
     return {"spec": v.get("spec"), "passed": len(results) - failed, "failed": failed, "results": results}

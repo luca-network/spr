@@ -15,12 +15,12 @@
 //   keys.jsonl           its public key, and any earlier ones
 //   intents.jsonl, cancellations.jsonl, checks.jsonl, records.jsonl, labels.jsonl   each sealed: { payload, seal }
 //   mandate.json         optional: the limits the agent acts under (currency, per payment, validity)
-import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, statSync, openSync, readSync, closeSync, rmSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import * as L from "@luca-network/spr";
 
-export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.1" };
+export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.2" };
 const RECORD_SCHEMA = "luca.record/0.7";   // SPR section 6; the hosted service seals the same schema
 const INTENT_SCHEMA = "luca.intent/0.1";
 const CLOCK_SKEW_MS = 2 * 60_000;
@@ -46,6 +46,17 @@ function durationMs(s) {
   return ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3] ?? 0)) * 60_000;
 }
 
+const FILES = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"];
+// One writer at a time: a book's folder may be opened by several processes (an MCP server and a script, an agent
+// run twice). Each write takes book.lock, reads what the others appended since, writes, and lets go.
+const LOCK_WAIT_MS = 10_000;
+const LOCK_STALE_MS = 30_000;
+const SLEEP = new Int32Array(new SharedArrayBuffer(4));
+const paymentKey = (p) => `${p.entity}:${p.rail}:${p.source.id}`;
+// What one import to Luca takes at most; a bigger book is sent in parts.
+export const PART_MAX_RECORDS = 4000;
+export const PART_MAX_BYTES = 8 * 1024 * 1024;
+
 export class SprBook {
   constructor(cfg) {
     if (!cfg?.agentId?.trim() || !cfg?.entity?.trim()) throw new Error("The book needs the agent's ID (agentId) and the company it pays for (entity)");
@@ -53,31 +64,92 @@ export class SprBook {
     this.cfg = { timeZone: "UTC", binding: false, now: () => new Date(), owner: null, producer: SDK_PRODUCER, ...cfg };
     this.dir = cfg.dir;
     mkdirSync(this.dir, { recursive: true });
-    if (cfg.key) this.key = typeof cfg.key === "string" ? createPrivateKey(cfg.key) : cfg.key;
-    else {
-      const keyFile = join(this.dir, "key.pem");
-      if (existsSync(keyFile)) this.key = createPrivateKey(readFileSync(keyFile, "utf8"));
+    this.keyFile = cfg.key ? null : join(this.dir, "key.pem");
+    this.lockDepth = 0;
+    this.reset();
+    this.locked(() => {
+      if (cfg.key) this.key = typeof cfg.key === "string" ? createPrivateKey(cfg.key) : cfg.key;
+      else if (existsSync(this.keyFile)) this.key = createPrivateKey(readFileSync(this.keyFile, "utf8"));
       else {
         this.key = generateKeyPairSync("ed25519").privateKey;
-        writeFileSync(keyFile, this.key.export({ type: "pkcs8", format: "pem" }).toString(), { mode: 0o600 });
+        writeFileSync(this.keyFile, this.key.export({ type: "pkcs8", format: "pem" }).toString(), { mode: 0o600 });
       }
-    }
-    if (this.key.asymmetricKeyType !== "ed25519") throw new Error("The book's key must be Ed25519");
-    this.keyId = L.keyIdFor(this.key);
-    if (!this.jsonl("keys.jsonl").some((k) => k.key_id === this.keyId))
-      this.append("keys.jsonl", { key_id: this.keyId, algorithm: "ed25519", public_pem: L.publicKeyPemOf(this.key), created_at: iso(this.now()), owner: this.cfg.entity });
-    this.intents = new Map(this.jsonl("intents.jsonl").map((i) => [i.payload.intent_id, i]));
-    this.cancellations = new Map(this.jsonl("cancellations.jsonl").map((c) => [c.payload.intent_id, c]));
-    this.records = this.jsonl("records.jsonl");
-    this.labels = this.jsonl("labels.jsonl");
+      if (this.key.asymmetricKeyType !== "ed25519") throw new Error("The book's key must be Ed25519");
+      this.keyId = L.keyIdFor(this.key);
+      this.checkNotRetired();
+      if (!this.keyring.has(this.keyId))
+        this.append("keys.jsonl", { key_id: this.keyId, algorithm: "ed25519", public_pem: L.publicKeyPemOf(this.key), created_at: iso(this.now()), owner: this.cfg.entity });
+    });
   }
 
   now() { return this.cfg.now(); }
-  jsonl(name) {
-    const f = join(this.dir, name);
-    return existsSync(f) ? readFileSync(f, "utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l)) : [];
+
+  // ---- the folder ----
+  // What is in memory, rebuilt from the files. Each file is read from where the last read stopped, so a write by
+  // another process is picked up and a large book is not read again on every call.
+  reset() {
+    this.offsets = {};
+    this.keyring = new Map();       // key_id -> keys.jsonl row
+    this.intents = new Map();       // intent_id -> sealed intent
+    this.byNonce = new Map();       // intent nonce (seq 0) -> sealed intent
+    this.cancellations = new Map(); // intent_id -> sealed withdrawal
+    this.records = [];              // every version, in the order sealed
+    this.byPayment = new Map();     // entity:rail:source -> current version
+    this.labels = [];
   }
-  append(name, row) { appendFileSync(join(this.dir, name), JSON.stringify(row) + "\n"); }
+  refresh() {
+    for (const n of FILES) {
+      const f = join(this.dir, n);
+      if (!existsSync(f)) { if (this.offsets[n]) { this.reset(); return this.refresh(); } continue; }
+      const size = statSync(f).size, from = this.offsets[n] ?? 0;
+      if (size < from) { this.reset(); return this.refresh(); }
+      if (size === from) continue;
+      const buf = Buffer.alloc(size - from), fd = openSync(f, "r");
+      try { readSync(fd, buf, 0, buf.length, from); } finally { closeSync(fd); }
+      const end = buf.lastIndexOf(10);   // only whole lines; a line being written is read next time
+      if (end < 0) continue;
+      this.offsets[n] = from + end + 1;
+      for (const l of buf.subarray(0, end + 1).toString("utf8").split("\n")) if (l.trim()) this.ingest(n, JSON.parse(l));
+    }
+  }
+  ingest(name, row) {
+    if (name === "keys.jsonl") this.keyring.set(row.key_id, row);
+    else if (name === "intents.jsonl") { this.intents.set(row.payload.intent_id, row); this.byNonce.set(L.intentNonce(row.seal.payload_sha256), row); }
+    else if (name === "cancellations.jsonl") this.cancellations.set(row.payload.intent_id, row);
+    else if (name === "records.jsonl") { this.records.push(row); this.byPayment.set(paymentKey(row.payload), row); }
+    else if (name === "labels.jsonl") this.labels.push(row);
+  }
+  locked(fn) {
+    if (this.lockDepth > 0) { this.lockDepth++; try { return fn(); } finally { this.lockDepth--; } }
+    const lock = join(this.dir, "book.lock"), deadline = Date.now() + LOCK_WAIT_MS;
+    for (;;) {
+      try { writeFileSync(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { flag: "wx" }); break; }
+      catch (e) {
+        if (e.code !== "EEXIST") throw e;
+        try { if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) { rmSync(lock, { force: true }); continue; } } catch { continue; }
+        if (Date.now() > deadline) throw new Error(`The book at ${this.dir} is busy: another process has held book.lock for over ${LOCK_WAIT_MS / 1000} seconds. If no other process is using the book, delete book.lock.`);
+        Atomics.wait(SLEEP, 0, 0, 20);
+      }
+    }
+    this.lockDepth = 1;
+    try {
+      this.refresh();
+      if (this.key) this.checkNotRetired();
+      return fn();
+    } finally { this.lockDepth = 0; rmSync(lock, { force: true }); }
+  }
+  // Another process may have rotated the key: pick up the new key from key.pem, or stop if the key was passed in.
+  checkNotRetired() {
+    for (;;) {
+      const next = [...this.keyring.values()].find((k) => k.rotation?.payload?.from === this.keyId);
+      if (!next) return;
+      if (!this.keyFile) throw new Error(`The book's key ${this.keyId} was rotated to ${next.key_id}; open the book with the new key`);
+      const k = createPrivateKey(readFileSync(this.keyFile, "utf8"));
+      if (L.keyIdFor(k) === this.keyId) throw new Error(`The book's key ${this.keyId} was rotated to ${next.key_id}, but key.pem still holds the old key`);
+      this.key = k; this.keyId = L.keyIdFor(k);
+    }
+  }
+  append(name, row) { appendFileSync(join(this.dir, name), JSON.stringify(row) + "\n"); this.refresh(); }
   sealRow(payload) { return { payload, seal: L.sealWith(payload, this.key) }; }
   mandate() {
     const f = join(this.dir, "mandate.json");
@@ -101,7 +173,8 @@ export class SprBook {
 
   // ---- before paying ----
   declare(input) { return this.recordIntent(input); }
-  recordIntent(input) {
+  recordIntent(input) { return this.locked(() => this._recordIntent(input)); }
+  _recordIntent(input) {
     if (!input?.purpose?.trim()) throw new Error("purpose is required: why you are paying, in one sentence");
     const cap = input.max_amount_minor ?? null;
     if (cap !== null && (!Number.isSafeInteger(cap) || cap <= 0)) throw new Error("max_amount_minor must be a positive integer in minor units");
@@ -121,7 +194,6 @@ export class SprBook {
     };
     const row = this.sealRow(payload);
     this.append("intents.jsonl", row);
-    this.intents.set(payload.intent_id, row);
     return {
       intent_id: payload.intent_id, decision: pre.decision, authority: pre.authority, checks: pre.checks, declared_at: payload.declared_at, expires_at: payload.expires_at,
       max_amount_minor: cap, seal: row.seal,
@@ -135,7 +207,8 @@ export class SprBook {
     return L.intentNonce(i.seal.payload_sha256, seq);
   }
 
-  cancelIntent(intentId, reason) {
+  cancelIntent(intentId, reason) { return this.locked(() => this._cancelIntent(intentId, reason)); }
+  _cancelIntent(intentId, reason) {
     const i = this.intents.get(intentId);
     if (!i) throw new Error(`No intent ${intentId} in this book`);
     if (!reason?.trim()) throw new Error("Say why the intent is withdrawn");
@@ -143,11 +216,11 @@ export class SprBook {
     const row = this.sealRow({ schema: "luca.intent-cancellation/0.1", intent_id: intentId, intent_payload_sha256: i.seal.payload_sha256,
       by: this.cfg.agentId, reason: reason.trim(), cancelled_at: iso(this.now()), producer: this.cfg.producer });
     this.append("cancellations.jsonl", row);
-    this.cancellations.set(intentId, row);
     return row.payload;
   }
 
   getIntent(intentId) {
+    this.refresh();
     const i = this.intents.get(intentId);
     if (!i) throw new Error(`No intent ${intentId} in this book`);
     const paid = this.current().filter((r) => r.payload.intent?.intent_id === intentId).map((r) => r.payload.record_id);
@@ -157,12 +230,13 @@ export class SprBook {
 
   intentFor(intentId, nonce) {
     if (intentId) return this.intents.get(intentId) ?? null;
-    if (nonce) for (const i of this.intents.values()) if (L.intentNonce(i.seal.payload_sha256) === nonce.toLowerCase()) return i;
+    if (nonce) return this.byNonce.get(nonce.toLowerCase()) ?? null;
     return null;
   }
 
   // Before paying: is this payment inside an open intent and the mandate? The answer is sealed and kept.
-  checkPayment(input) {
+  checkPayment(input) { return this.locked(() => this._checkPayment(input)); }
+  _checkPayment(input) {
     const now = this.now();
     const currency = String(input.currency ?? "").toUpperCase();
     const i = this.intentFor(input.intent_id, input.nonce);
@@ -205,22 +279,22 @@ export class SprBook {
   }
 
   current() {
-    const replaced = new Set(this.records.map((r) => r.payload.supersedes).filter(Boolean));
-    return this.records.filter((r) => !replaced.has(r.payload.record_id));
+    return [...this.byPayment.values()];
   }
 
   // ---- after paying ----
   seal(input) { return this.recordSettlement(input); }
   // A payment the agent made (or received), sealed as reported_by "agent". Reporting the same payment again
   // with different facts makes a new version that names the one it replaces; the same facts return the record.
-  recordSettlement(input) {
+  recordSettlement(input) { return this.locked(() => this._recordSettlement(input)); }
+  _recordSettlement(input) {
     if (!input?.rail || !input.source_id) throw new Error("rail and source_id are required");
     if (!Number.isSafeInteger(input.amount_minor)) throw new Error("amount_minor must be an integer in minor units");
     if (!input.currency) throw new Error("currency is required");
     const currency = input.currency.toUpperCase();
     const sourceId = /^0x[0-9a-f]+$/i.test(input.source_id) ? input.source_id.toLowerCase() : input.source_id;
     const key = `${this.cfg.entity}:${input.rail}:${sourceId}`;
-    const earlier = this.current().find((r) => `${r.payload.entity}:${r.payload.rail}:${r.payload.source.id}` === key) ?? null;
+    const earlier = this.byPayment.get(key) ?? null;
     // Without occurred_at the record says so and takes the time of sealing; a retry keeps the time first sealed.
     const timeGiven = input.occurred_at !== undefined && input.occurred_at !== null;
     const at = timeGiven ? instant(input.occurred_at, "occurred_at") : earlier ? new Date(earlier.payload.occurred_at) : this.now();
@@ -270,7 +344,6 @@ export class SprBook {
     if (problems.length) throw new Error(`The record would not meet SPR: ${problems.join("; ")}`);
     const row = this.sealRow(payload);
     this.append("records.jsonl", row);
-    this.records.push(row);
     return { status: earlier ? "new_version" : "recorded", record_id: payload.record_id, within_consent: consent?.within_consent ?? null,
       binding: consent?.binding.status ?? null, checks: consent?.checks ?? [],
       seal: row.seal };
@@ -279,7 +352,8 @@ export class SprBook {
   // ---- the label (SPR section 7) ----
   // The company's side: the shared fields of a record, signed with the company's key. The counterparty signs
   // the same signing input with its own key to agree; counterpartySignature checks that.
-  label(recordId, opts) {
+  label(recordId, opts) { return this.locked(() => this._label(recordId, opts)); }
+  _label(recordId, opts) {
     const r = this.current().find((x) => x.payload.record_id === recordId || x.payload.record_id.replace(/-v\d+$/, "") === recordId.replace(/-v\d+$/, ""));
     if (!r) throw new Error(`No record ${recordId} in this book`);
     if (!opts?.counterparty) throw new Error("Name the counterparty the label is for");
@@ -298,31 +372,34 @@ export class SprBook {
     const ours = { party: "company", key_id: this.keyId, alg: "EdDSA", signature: L.signLabel(this.key, labelId, sharedSha) };
     const row = { label_id: labelId, record_id: p.record_id, shared, shared_sha256: sharedSha, sign_this: L.labelSigningInput(labelId, sharedSha), signatures: [ours] };
     this.append("labels.jsonl", row);
-    this.labels.push(row);
     return row;
   }
   // Records the counterparty's signature once it checks against its public key; the label is then agreed.
-  counterpartySignature(labelId, jwk, signature) {
+  counterpartySignature(labelId, jwk, signature) { return this.locked(() => this._counterpartySignature(labelId, jwk, signature)); }
+  _counterpartySignature(labelId, jwk, signature) {
     const l = [...this.labels].reverse().find((x) => x.label_id === labelId);
     if (!l) throw new Error(`No label ${labelId} in this book`);
     const pub = L.checkPublicJwk(jwk);
     if (!L.verifyLabelSignature(pub, labelId, l.shared_sha256, signature)) throw new Error("The signature does not verify with that key over sign_this");
     const row = { ...l, signatures: [...l.signatures, { party: "counterparty", key_thumbprint: L.jwkThumbprint(pub), jwk: pub, alg: pub.kty === "OKP" ? "EdDSA" : "ES256", signature }], state: "agreed" };
     this.append("labels.jsonl", row);
-    this.labels.push(row);
     return row;
   }
 
   verifyRecord(recordId) {
+    this.refresh();
     const r = this.records.find((x) => x.payload.record_id === recordId);
     if (!r) throw new Error(`No record ${recordId} in this book`);
-    const v = L.verifySeal(r.payload, r.seal, this.key);
+    // Checked with the key that sealed it, which may be an earlier key of the book.
+    const keyId = L.normalizeSeal(r.seal).key_id, k = this.keyring.get(keyId);
+    const v = k ? L.verifySeal(r.payload, r.seal, k.public_pem) : { ok: false, hash_matches: false, signature_valid: false };
     const core = L.checkRecord(r.payload);
-    return { record_id: recordId, ...v, ok: v.ok && core.ok, core_fields: core, key_id: this.keyId,
+    return { record_id: recordId, ...v, ok: v.ok && core.ok, core_fields: core, key_id: keyId,
       how_to_check: "SHA-256 of the canonical JSON (RFC 8785) of payload is seal.payload_sha256; the Ed25519 signature over that canonical JSON verifies with the public key in keys.jsonl. Run: spr-verify <folder>" };
   }
 
   listRecords(opts = {}) {
+    this.refresh();
     return (opts.all ? this.records : this.current()).map((r) => ({ record_id: r.payload.record_id, rail: r.payload.rail, amount_minor: r.payload.amount_minor,
       currency: r.payload.currency, settled_on: r.payload.settled_on, counterparty: r.payload.counterparty, intent_id: r.payload.intent?.intent_id ?? null,
       within_consent: r.payload.consent?.within_consent ?? null, payload_sha256: r.seal.payload_sha256 }));
@@ -333,12 +410,47 @@ export class SprBook {
 
   // The book as a package (SPR section 8): each file by name, as text, with a sealed manifest of their hashes.
   packageFiles() {
-    const names = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"].filter((n) => existsSync(join(this.dir, n)));
-    const files = Object.fromEntries(names.map((n) => [n, readFileSync(join(this.dir, n), "utf8")]));
+    return this.locked(() => {
+      const names = FILES.filter((n) => existsSync(join(this.dir, n)));
+      return this.sealPackage(Object.fromEntries(names.map((n) => [n, readFileSync(join(this.dir, n), "utf8")])));
+    });
+  }
+  sealPackage(files, part = null) {
+    const names = Object.keys(files);
     const pkg = { schema: "luca.local-package/0.1", entity: this.cfg.entity, generated_at: iso(this.now()), producer: this.cfg.producer, format: L.SPEC_VERSION,
-      files: names.map((name) => ({ name, sha256: L.sha256Hex(Buffer.from(files[name], "utf8")) })) };
-    files["manifest.json"] = JSON.stringify({ package: pkg, seal: L.sealWith(pkg, this.key) }, null, 2) + "\n";
-    return files;
+      ...(part ? { part } : {}), files: names.map((name) => ({ name, sha256: L.sha256Hex(Buffer.from(files[name], "utf8")) })) };
+    return { ...files, "manifest.json": JSON.stringify({ package: pkg, seal: L.sealWith(pkg, this.key) }, null, 2) + "\n" };
+  }
+  // The book in parts that each stand on their own: every version of a payment stays in one part, with the intents
+  // and withdrawals its records name, and the book's keys. A book under the limits is one part, the whole book.
+  packageParts(opts = {}) {
+    const maxRecords = opts.maxRecords ?? PART_MAX_RECORDS, maxBytes = opts.maxBytes ?? PART_MAX_BYTES;
+    return this.locked(() => {
+      const whole = FILES.filter((n) => existsSync(join(this.dir, n))).reduce((t, n) => t + statSync(join(this.dir, n)).size, 0);
+      if (this.records.length <= maxRecords && whole <= maxBytes) return [this.packageFiles()];
+      const line = (row) => JSON.stringify(row) + "\n";
+      const chains = new Map();
+      for (const r of this.records) { const k = paymentKey(r.payload); if (!chains.has(k)) chains.set(k, []); chains.get(k).push(r); }
+      const keysText = [...this.keyring.values()].map(line).join("");
+      const groups = [];
+      let cur = { records: [], bytes: 0 };
+      for (const chain of chains.values()) {
+        const bytes = chain.reduce((t, r) => t + Buffer.byteLength(line(r)), 0);
+        if (cur.records.length && (cur.records.length + chain.length > maxRecords || cur.bytes + bytes > maxBytes)) { groups.push(cur); cur = { records: [], bytes: 0 }; }
+        cur.records.push(...chain); cur.bytes += bytes;
+      }
+      if (cur.records.length) groups.push(cur);
+      return groups.map((g, i) => {
+        const ids = new Set(g.records.map((r) => r.payload.intent?.intent_id).filter(Boolean));
+        const files = { "keys.jsonl": keysText };
+        const intents = [...ids].map((id) => this.intents.get(id)).filter(Boolean);
+        if (intents.length) files["intents.jsonl"] = intents.map(line).join("");
+        const cancels = [...ids].map((id) => this.cancellations.get(id)).filter(Boolean);
+        if (cancels.length) files["cancellations.jsonl"] = cancels.map(line).join("");
+        files["records.jsonl"] = g.records.map(line).join("");
+        return this.sealPackage(files, { index: i + 1, of: groups.length });
+      });
+    });
   }
 
   // A copy of the book for an auditor, a counterparty or Luca: the files and a sealed manifest of their hashes.
@@ -350,11 +462,42 @@ export class SprBook {
     return { folder: outDir, files: Object.keys(files), verified: check.ok, passed: check.passed, failed: check.failed };
   }
 
+  // ---- the key ----
+  // A new key for the book, handed over by the old one: keys.jsonl gains the new public key with a handover sealed by
+  // the old key, so anyone can check that the same company holds both. Records sealed before stay checkable with the
+  // old public key. The book's own key.pem is replaced; a key passed in (opts.key) is the caller's to keep.
+  rotateKey(opts = {}) {
+    return this.locked(() => {
+      const next = opts.key ? (typeof opts.key === "string" ? createPrivateKey(opts.key) : opts.key) : generateKeyPairSync("ed25519").privateKey;
+      if (next.asymmetricKeyType !== "ed25519") throw new Error("The book's key must be Ed25519");
+      if (!this.keyFile && !opts.key) throw new Error("This book's key was passed in; pass the new one as rotateKey({ key })");
+      const handover = { schema: "luca.key-rotation/0.1", from: this.keyId, to: L.keyIdFor(next), to_public_pem: L.publicKeyPemOf(next),
+        at: iso(this.now()), entity: this.cfg.entity, ...(opts.reason ? { reason: String(opts.reason) } : {}) };
+      if (handover.to === handover.from) throw new Error("The new key is the key the book already has");
+      if (this.keyFile) {
+        writeFileSync(this.keyFile + ".new", next.export({ type: "pkcs8", format: "pem" }).toString(), { mode: 0o600 });
+        renameSync(this.keyFile + ".new", this.keyFile);
+      }
+      this.append("keys.jsonl", { key_id: handover.to, algorithm: "ed25519", public_pem: handover.to_public_pem, created_at: handover.at,
+        owner: this.cfg.entity, rotation: { payload: handover, seal: L.sealWith(handover, this.key) } });
+      this.key = next; this.keyId = handover.to;
+      return { from: handover.from, to: handover.to, at: handover.at, key_file: this.keyFile,
+        next: "If Luca keeps this book, send it again: the handover registers the new key" };
+    });
+  }
+
   // ---- Luca, the hosted service (optional) ----
   // Sends the book to Luca's hosted service, which checks every seal before it stores anything. The book's key is
-  // registered with Luca first (registerWithLuca). Sending the same book again changes nothing.
+  // registered with Luca first (registerWithLuca). Sending the same book again changes nothing. A book over one
+  // import's limits goes in parts, one after the other.
   async sendToLuca(opts = {}) {
-    return lucaCall(opts, "/v1/spr/import", { files: this.packageFiles() });
+    const parts = this.packageParts(opts);
+    if (parts.length === 1) return lucaCall(opts, "/v1/spr/import", { files: parts[0] });
+    const results = [];
+    for (const files of parts) results.push(await lucaCall(opts, "/v1/spr/import", { files }));
+    const sum = (k) => results.reduce((t, r) => t + (r[k] ?? 0), 0);
+    return { parts: results.length, created: sum("created"), versioned: sum("versioned"), unchanged: sum("unchanged"),
+      read_from_rail: sum("read_from_rail"), differs_from_rail: sum("differs_from_rail"), results };
   }
   // Asks Luca to accept this book's key for one of the company's entities, with a finance user's key.
   // agentOnly limits the key to this book's agent.

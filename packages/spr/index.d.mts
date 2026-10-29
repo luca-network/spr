@@ -46,4 +46,6 @@ export declare function checkRecord(payload: unknown): CoreCheck;
 export declare function checkIntent(payload: unknown): CoreCheck;
 
 export interface PackageCheck { kind: "book" | "package"; ok: boolean; passed: number; failed: number; results: { what: string; ok: boolean; detail: string }[] }
+export declare const KEY_ROTATION_SCHEMA: "luca.key-rotation/0.1";
+export declare function checkKeyHandover(row: any, keys: Map<string, any> | Record<string, any>): { ok: boolean; detail: string };
 export declare function verifyPackage(read: (name: string) => Buffer | null): PackageCheck;

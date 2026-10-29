@@ -10,10 +10,12 @@ spr-verify checks either with no Luca code.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -23,10 +25,37 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from . import format as L
 
-SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.1"}
+SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.2"}
 RECORD_SCHEMA = "luca.record/0.7"
 INTENT_SCHEMA = "luca.intent/0.1"
 CLOCK_SKEW = timedelta(minutes=2)
+FILES = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"]
+# One writer at a time: each write takes book.lock, reads what other processes appended since, writes, and lets go.
+LOCK_WAIT = 10.0
+LOCK_STALE = 30.0
+# What one import to Luca takes at most; a bigger book is sent in parts.
+PART_MAX_RECORDS = 4000
+PART_MAX_BYTES = 8 * 1024 * 1024
+KEY_ROTATION_SCHEMA = "luca.key-rotation/0.1"
+
+
+def _payment_key(p):
+    return f"{p['entity']}:{p['rail']}:{p['source']['id']}"
+
+
+def _line(row) -> str:
+    return json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def _pem(key) -> bytes:
+    return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+
+
+def _writes(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *a, **k):
+        return self._locked(lambda: fn(self, *a, **k))
+    return wrapper
 
 
 
@@ -77,38 +106,139 @@ class SprBook:
         self.time_zone, self.binding, self._now = time_zone, binding, now or (lambda: datetime.now(timezone.utc))
         self.producer = producer or SDK_PRODUCER
         os.makedirs(dir, exist_ok=True)
-        if key is None:
-            path = os.path.join(dir, "key.pem")
-            if os.path.exists(path):
-                with open(path, "rb") as f:
-                    key = serialization.load_pem_private_key(f.read(), None)
-            else:
-                key = ed25519.Ed25519PrivateKey.generate()
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "wb") as f:
-                    f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
-        if not isinstance(key, ed25519.Ed25519PrivateKey):
-            raise ValueError("The book's key must be Ed25519")
-        self.key, self.key_id = key, L.key_id_for(key)
-        if not any(k["key_id"] == self.key_id for k in self._jsonl("keys.jsonl")):
-            self._append("keys.jsonl", {"key_id": self.key_id, "algorithm": "ed25519", "public_pem": L.public_key_pem_of(key),
-                                        "created_at": _iso(self._now()), "owner": entity})
-        self.intents = {i["payload"]["intent_id"]: i for i in self._jsonl("intents.jsonl")}
-        self.cancellations = {c["payload"]["intent_id"]: c for c in self._jsonl("cancellations.jsonl")}
-        self.records = self._jsonl("records.jsonl")
-        self.labels = self._jsonl("labels.jsonl")
+        self.key_file = None if key is not None else os.path.join(dir, "key.pem")
+        self._depth = 0
+        self.key = None
+        self._reset()
 
-    # ---- files ----
-    def _jsonl(self, name):
-        p = os.path.join(self.dir, name)
-        if not os.path.exists(p):
-            return []
-        with open(p, encoding="utf-8") as f:
-            return [json.loads(l) for l in f if l.strip()]
+        def setup():
+            k = key
+            if k is None:
+                if os.path.exists(self.key_file):
+                    with open(self.key_file, "rb") as f:
+                        k = serialization.load_pem_private_key(f.read(), None)
+                else:
+                    k = ed25519.Ed25519PrivateKey.generate()
+                    fd = os.open(self.key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(_pem(k))
+            if not isinstance(k, ed25519.Ed25519PrivateKey):
+                raise ValueError("The book's key must be Ed25519")
+            self.key, self.key_id = k, L.key_id_for(k)
+            self._check_not_retired()
+            if self.key_id not in self.keyring:
+                self._append("keys.jsonl", {"key_id": self.key_id, "algorithm": "ed25519", "public_pem": L.public_key_pem_of(k),
+                                            "created_at": _iso(self._now()), "owner": entity})
+        self._locked(setup)
+
+    # ---- the folder ----
+    # What is in memory, rebuilt from the files. Each file is read from where the last read stopped, so a write by
+    # another process is picked up and a large book is not read again on every call.
+    def _reset(self):
+        self._offsets = {}
+        self.keyring = {}
+        self.intents = {}
+        self._by_nonce = {}
+        self.cancellations = {}
+        self.records = []
+        self._by_payment = {}
+        self.labels = []
+
+    def _refresh(self):
+        for n in FILES:
+            p = os.path.join(self.dir, n)
+            if not os.path.exists(p):
+                if self._offsets.get(n):
+                    self._reset()
+                    return self._refresh()
+                continue
+            size, start = os.path.getsize(p), self._offsets.get(n, 0)
+            if size < start:
+                self._reset()
+                return self._refresh()
+            if size == start:
+                continue
+            with open(p, "rb") as f:
+                f.seek(start)
+                buf = f.read(size - start)
+            end = buf.rfind(b"\n")
+            if end < 0:
+                continue
+            self._offsets[n] = start + end + 1
+            for l in buf[: end + 1].decode("utf-8").split("\n"):
+                if l.strip():
+                    self._ingest(n, json.loads(l))
+
+    def _ingest(self, name, row):
+        if name == "keys.jsonl":
+            self.keyring[row["key_id"]] = row
+        elif name == "intents.jsonl":
+            self.intents[row["payload"]["intent_id"]] = row
+            self._by_nonce[L.intent_nonce(row["seal"]["payload_sha256"])] = row
+        elif name == "cancellations.jsonl":
+            self.cancellations[row["payload"]["intent_id"]] = row
+        elif name == "records.jsonl":
+            self.records.append(row)
+            self._by_payment[_payment_key(row["payload"])] = row
+        elif name == "labels.jsonl":
+            self.labels.append(row)
+
+    def _locked(self, fn):
+        if self._depth > 0:
+            self._depth += 1
+            try:
+                return fn()
+            finally:
+                self._depth -= 1
+        lock, deadline = os.path.join(self.dir, "book.lock"), time.monotonic() + LOCK_WAIT
+        while True:
+            try:
+                fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(json.dumps({"pid": os.getpid(), "at": _iso(datetime.now(timezone.utc))}))
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(lock) > LOCK_STALE:
+                        os.remove(lock)
+                        continue
+                except FileNotFoundError:
+                    continue
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"The book at {self.dir} is busy: another process has held book.lock for over {int(LOCK_WAIT)} seconds. "
+                                       "If no other process is using the book, delete book.lock.")
+                time.sleep(0.02)
+        self._depth = 1
+        try:
+            self._refresh()
+            if self.key is not None:
+                self._check_not_retired()
+            return fn()
+        finally:
+            self._depth = 0
+            try:
+                os.remove(lock)
+            except FileNotFoundError:
+                pass
+
+    def _check_not_retired(self):
+        """Another process may have rotated the key: pick up the new key from key.pem, or stop if the key was passed in."""
+        while True:
+            nxt = next((k for k in self.keyring.values() if ((k.get("rotation") or {}).get("payload") or {}).get("from") == self.key_id), None)
+            if not nxt:
+                return
+            if not self.key_file:
+                raise ValueError(f"The book's key {self.key_id} was rotated to {nxt['key_id']}; open the book with the new key")
+            with open(self.key_file, "rb") as f:
+                k = serialization.load_pem_private_key(f.read(), None)
+            if L.key_id_for(k) == self.key_id:
+                raise ValueError(f"The book's key {self.key_id} was rotated to {nxt['key_id']}, but key.pem still holds the old key")
+            self.key, self.key_id = k, L.key_id_for(k)
 
     def _append(self, name, row):
-        with open(os.path.join(self.dir, name), "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        with open(os.path.join(self.dir, name), "a", encoding="utf-8", newline="") as f:
+            f.write(_line(row))
+        self._refresh()
 
     def _seal_row(self, payload):
         return {"payload": payload, "seal": L.seal_with(payload, self.key)}
@@ -139,6 +269,7 @@ class SprBook:
                 "mandate_id": m.get("mandate_id")}
 
     # ---- before paying ----
+    @_writes
     def declare(self, purpose: str, max_amount_minor: Optional[int] = None, currency: Optional[str] = None, counterparty: Optional[str] = None,
                 expected_amount_minor: Optional[int] = None, rail: Optional[str] = None, rail_ref: Optional[dict] = None,
                 terms: Optional[dict] = None, expires_in: Optional[str] = None, expires_in_hours: Optional[int] = None) -> dict:
@@ -163,7 +294,6 @@ class SprBook:
         }
         row = self._seal_row(payload)
         self._append("intents.jsonl", row)
-        self.intents[payload["intent_id"]] = row
         return {"intent_id": payload["intent_id"], "decision": pre["decision"], "authority": pre["authority"], "checks": pre["checks"], "declared_at": payload["declared_at"],
                 "expires_at": payload["expires_at"], "max_amount_minor": cap, "seal": row["seal"],
                 "binding": {"scheme": L.INTENT_NONCE_SCHEME, "nonce": L.intent_nonce(row["seal"]["payload_sha256"])} if self.binding else None}
@@ -176,6 +306,7 @@ class SprBook:
             raise KeyError(f"No intent {intent_id} in this book")
         return L.intent_nonce(i["seal"]["payload_sha256"], seq)
 
+    @_writes
     def cancel_intent(self, intent_id: str, reason: str) -> dict:
         i = self.intents.get(intent_id)
         if not i:
@@ -187,10 +318,10 @@ class SprBook:
         row = self._seal_row({"schema": "luca.intent-cancellation/0.1", "intent_id": intent_id, "intent_payload_sha256": i["seal"]["payload_sha256"],
                               "by": self.agent_id, "reason": reason.strip(), "cancelled_at": _iso(self._now()), "producer": self.producer})
         self._append("cancellations.jsonl", row)
-        self.cancellations[intent_id] = row
         return row["payload"]
 
     def get_intent(self, intent_id: str) -> dict:
+        self._refresh()
         i = self.intents.get(intent_id)
         if not i:
             raise KeyError(f"No intent {intent_id} in this book")
@@ -202,9 +333,7 @@ class SprBook:
         if intent_id:
             return self.intents.get(intent_id)
         if nonce:
-            for i in self.intents.values():
-                if L.intent_nonce(i["seal"]["payload_sha256"]) == nonce.lower():
-                    return i
+            return self._by_nonce.get(nonce.lower())
         return None
 
 
@@ -229,6 +358,7 @@ class SprBook:
                    if nonce else {"scheme": L.INTENT_NONCE_SCHEME, "status": "not_applicable", "nonce": None, "expected": expected, "seq": 0})
         return {"intent_id": ip["intent_id"], "within_consent": all(x["ok"] for x in checks), "checks": checks, "binding": binding}
 
+    @_writes
     def check_payment(self, amount_minor: int, currency: str, counterparty: Optional[str] = None, intent_id: Optional[str] = None,
                       nonce: Optional[str] = None,
                       ) -> dict:
@@ -248,10 +378,10 @@ class SprBook:
                 "reasons": [f"{c['check']}: {c['detail']}" for c in checks if not c["ok"]], "seal": row["seal"]}
 
     def _current(self):
-        replaced = {r["payload"].get("supersedes") for r in self.records if r["payload"].get("supersedes")}
-        return [r for r in self.records if r["payload"]["record_id"] not in replaced]
+        return list(self._by_payment.values())
 
     # ---- after paying ----
+    @_writes
     def seal(self, rail: str, source_id: str, amount_minor: int, currency: str, occurred_at: Optional[str] = None, counterparty: Optional[str] = None,
              intent_id: Optional[str] = None, memo: Optional[str] = None, state: Optional[str] = None, direction: str = "outflow",
              nonce: Optional[str] = None, evidence: Optional[dict] = None, correction: Optional[dict] = None,
@@ -265,7 +395,7 @@ class SprBook:
         cur = currency.upper()
         src = source_id.lower() if re.fullmatch(r"0x[0-9a-fA-F]+", source_id) else source_id
         key = f"{self.entity}:{rail}:{src}"
-        earlier = next((r for r in self._current() if f"{r['payload']['entity']}:{r['payload']['rail']}:{r['payload']['source']['id']}" == key), None)
+        earlier = self._by_payment.get(key)
         # Without occurred_at the record says so and takes the time of sealing; a retry keeps the time first sealed.
         given = occurred_at is not None
         at = _instant(occurred_at, "occurred_at") if given else _parse(earlier["payload"]["occurred_at"]) if earlier else self._now()
@@ -317,7 +447,6 @@ class SprBook:
             raise ValueError(f"The record would not meet SPR: {'; '.join(problems)}")
         row = self._seal_row(payload)
         self._append("records.jsonl", row)
-        self.records.append(row)
         return {"status": "new_version" if earlier else "recorded", "record_id": payload["record_id"],
                 "within_consent": consent["within_consent"] if consent else None, "binding": consent["binding"]["status"] if consent else None,
                 "checks": consent["checks"] if consent else [],
@@ -326,6 +455,7 @@ class SprBook:
     record_settlement = seal
 
     # ---- the label (SPR section 7) ----
+    @_writes
     def label(self, record_id: str, counterparty: str, product: Optional[dict] = None, tax: Optional[dict] = None,
               network: Optional[str] = None, service_period: Any = None) -> dict:
         base = re.sub(r"-v\d+$", "", record_id)
@@ -347,9 +477,9 @@ class SprBook:
                "sign_this": L.label_signing_input(label_id, sha),
                "signatures": [{"party": "company", "key_id": self.key_id, "alg": "EdDSA", "signature": L.sign_label(self.key, label_id, sha)}]}
         self._append("labels.jsonl", row)
-        self.labels.append(row)
         return row
 
+    @_writes
     def counterparty_signature(self, label_id: str, jwk: dict, signature: str) -> dict:
         l = next((x for x in reversed(self.labels) if x["label_id"] == label_id), None)
         if not l:
@@ -360,18 +490,22 @@ class SprBook:
         row = {**l, "signatures": l["signatures"] + [{"party": "counterparty", "key_thumbprint": L.jwk_thumbprint(pub), "jwk": pub,
                                                       "alg": "EdDSA" if pub["kty"] == "OKP" else "ES256", "signature": signature}], "state": "agreed"}
         self._append("labels.jsonl", row)
-        self.labels.append(row)
         return row
 
     def verify_record(self, record_id: str) -> dict:
+        self._refresh()
         r = next((x for x in self.records if x["payload"]["record_id"] == record_id), None)
         if not r:
             raise KeyError(f"No record {record_id} in this book")
-        v = L.verify_seal(r["payload"], r["seal"], self.key)
+        # Checked with the key that sealed it, which may be an earlier key of the book.
+        key_id = L.normalize_seal(r["seal"])["key_id"]
+        k = self.keyring.get(key_id)
+        v = L.verify_seal(r["payload"], r["seal"], k["public_pem"]) if k else {"ok": False, "hash_matches": False, "signature_valid": False}
         core = L.check_record(r["payload"])
-        return {"record_id": record_id, **v, "ok": v["ok"] and core["ok"], "core_fields": core, "key_id": self.key_id}
+        return {"record_id": record_id, **v, "ok": v["ok"] and core["ok"], "core_fields": core, "key_id": key_id}
 
     def list_records(self, all: bool = False) -> list:
+        self._refresh()
         return [{"record_id": r["payload"]["record_id"], "rail": r["payload"]["rail"], "amount_minor": r["payload"]["amount_minor"],
                  "currency": r["payload"]["currency"], "settled_on": r["payload"]["settled_on"], "counterparty": r["payload"].get("counterparty"),
                  "intent_id": (r["payload"].get("intent") or {}).get("intent_id"), "within_consent": (r["payload"].get("consent") or {}).get("within_consent"),
@@ -383,15 +517,83 @@ class SprBook:
 
     def package_files(self) -> dict:
         """The book as a package (SPR section 8): each file by name, as text, with a sealed manifest of their hashes."""
-        names = [n for n in ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"] if os.path.exists(os.path.join(self.dir, n))]
-        files = {}
-        for n in names:
-            with open(os.path.join(self.dir, n), encoding="utf-8", newline="") as f:
-                files[n] = f.read()
+        def build():
+            files = {}
+            for n in FILES:
+                p = os.path.join(self.dir, n)
+                if os.path.exists(p):
+                    with open(p, encoding="utf-8", newline="") as f:
+                        files[n] = f.read()
+            return self._seal_package(files)
+        return self._locked(build)
+
+    def _seal_package(self, files: dict, part: Optional[dict] = None) -> dict:
         pkg = {"schema": "luca.local-package/0.1", "entity": self.entity, "generated_at": _iso(self._now()), "producer": self.producer,
-               "format": L.SPEC_VERSION, "files": [{"name": n, "sha256": L.sha256_hex(files[n].encode("utf-8"))} for n in names]}
-        files["manifest.json"] = json.dumps({"package": pkg, "seal": L.seal_with(pkg, self.key)}, indent=2, ensure_ascii=False) + "\n"
-        return files
+               "format": L.SPEC_VERSION, **({"part": part} if part else {}),
+               "files": [{"name": n, "sha256": L.sha256_hex(t.encode("utf-8"))} for n, t in files.items()]}
+        return {**files, "manifest.json": json.dumps({"package": pkg, "seal": L.seal_with(pkg, self.key)}, indent=2, ensure_ascii=False) + "\n"}
+
+    def package_parts(self, max_records: int = PART_MAX_RECORDS, max_bytes: int = PART_MAX_BYTES) -> list:
+        """The book in parts that each stand on their own: every version of a payment stays in one part, with the intents
+        and withdrawals its records name, and the book's keys. A book under the limits is one part, the whole book."""
+        def build():
+            whole = sum(os.path.getsize(os.path.join(self.dir, n)) for n in FILES if os.path.exists(os.path.join(self.dir, n)))
+            if len(self.records) <= max_records and whole <= max_bytes:
+                return [self.package_files()]
+            chains = {}
+            for r in self.records:
+                chains.setdefault(_payment_key(r["payload"]), []).append(r)
+            keys_text = "".join(_line(k) for k in self.keyring.values())
+            groups, cur, size = [], [], 0
+            for chain in chains.values():
+                b = sum(len(_line(r).encode("utf-8")) for r in chain)
+                if cur and (len(cur) + len(chain) > max_records or size + b > max_bytes):
+                    groups.append(cur)
+                    cur, size = [], 0
+                cur += chain
+                size += b
+            if cur:
+                groups.append(cur)
+            parts = []
+            for n, g in enumerate(groups, 1):
+                ids = list(dict.fromkeys((r["payload"].get("intent") or {}).get("intent_id") for r in g if (r["payload"].get("intent") or {}).get("intent_id")))
+                files = {"keys.jsonl": keys_text}
+                intents = [self.intents[i] for i in ids if i in self.intents]
+                if intents:
+                    files["intents.jsonl"] = "".join(_line(i) for i in intents)
+                cancels = [self.cancellations[i] for i in ids if i in self.cancellations]
+                if cancels:
+                    files["cancellations.jsonl"] = "".join(_line(c) for c in cancels)
+                files["records.jsonl"] = "".join(_line(r) for r in g)
+                parts.append(self._seal_package(files, {"index": n, "of": len(groups)}))
+            return parts
+        return self._locked(build)
+
+    @_writes
+    def rotate_key(self, key: Optional[ed25519.Ed25519PrivateKey] = None, reason: Optional[str] = None) -> dict:
+        """A new key for the book, handed over by the old one: keys.jsonl gains the new public key with a handover sealed
+        by the old key. Records sealed before stay checkable. The book's own key.pem is replaced; a key passed in is yours to keep."""
+        if not self.key_file and key is None:
+            raise ValueError("This book's key was passed in; pass the new one as rotate_key(key=...)")
+        nxt = key or ed25519.Ed25519PrivateKey.generate()
+        if not isinstance(nxt, ed25519.Ed25519PrivateKey):
+            raise ValueError("The book's key must be Ed25519")
+        handover = {"schema": KEY_ROTATION_SCHEMA, "from": self.key_id, "to": L.key_id_for(nxt), "to_public_pem": L.public_key_pem_of(nxt),
+                    "at": _iso(self._now()), "entity": self.entity, **({"reason": str(reason)} if reason else {})}
+        if handover["to"] == handover["from"]:
+            raise ValueError("The new key is the key the book already has")
+        if self.key_file:
+            tmp = self.key_file + ".new"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(_pem(nxt))
+            os.replace(tmp, self.key_file)
+        self._append("keys.jsonl", {"key_id": handover["to"], "algorithm": "ed25519", "public_pem": handover["to_public_pem"],
+                                    "created_at": handover["at"], "owner": self.entity,
+                                    "rotation": {"payload": handover, "seal": L.seal_with(handover, self.key)}})
+        self.key, self.key_id = nxt, handover["to"]
+        return {"from": handover["from"], "to": handover["to"], "at": handover["at"], "key_file": self.key_file,
+                "next": "If Luca keeps this book, send it again: the handover registers the new key"}
 
     def export_package(self, out_dir: str) -> dict:
         os.makedirs(out_dir, exist_ok=True)
@@ -403,10 +605,17 @@ class SprBook:
         return {"folder": out_dir, "files": list(files), "verified": check["ok"], "passed": check["passed"], "failed": check["failed"]}
 
     # ---- Luca, the hosted service (optional) ----
-    def send_to_luca(self, url: Optional[str] = None, api_key: Optional[str] = None) -> dict:
+    def send_to_luca(self, url: Optional[str] = None, api_key: Optional[str] = None, max_records: int = PART_MAX_RECORDS,
+                     max_bytes: int = PART_MAX_BYTES) -> dict:
         """Sends the book to Luca's hosted service, which checks every seal before it stores anything. The key is
-        registered with Luca first (register_with_luca). Sending it again changes nothing."""
-        return _luca_call(url, api_key, "/v1/spr/import", {"files": self.package_files()})
+        registered with Luca first (register_with_luca). Sending it again changes nothing. A book over one import's
+        limits goes in parts, one after the other."""
+        parts = self.package_parts(max_records, max_bytes)
+        if len(parts) == 1:
+            return _luca_call(url, api_key, "/v1/spr/import", {"files": parts[0]})
+        results = [_luca_call(url, api_key, "/v1/spr/import", {"files": p}) for p in parts]
+        total = lambda k: sum(r.get(k, 0) for r in results)
+        return {"parts": len(results), **{k: total(k) for k in ["created", "versioned", "unchanged", "read_from_rail", "differs_from_rail"]}, "results": results}
 
     def register_with_luca(self, entity_id: str, url: Optional[str] = None, api_key: Optional[str] = None, agent_only: bool = False) -> dict:
         """Asks Luca to accept this book's key for one of the company's entities, with a finance user's key."""

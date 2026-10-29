@@ -20,7 +20,7 @@ node bin/spr-verify.mjs --vectors          # the library against the vectors
 node bin/spr-verify.mjs <package folder>   # a package, with no Luca code
 ```
 
-Luca's service seals with this library, and so does Luca's MCP server in local mode (`npm run mcp -- --local`).
+The library runs wherever you run it and makes no call to Luca. Luca's hosted service seals with the same library.
 
 ## Licence
 

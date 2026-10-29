@@ -167,3 +167,65 @@ class BookFolder(unittest.TestCase):
             leaked = spr.verify_folder(exp)
             self.assertFalse(leaked["ok"])
             self.assertTrue(any(r["what"] == "the package holds no private key" and not r["ok"] for r in leaked["results"]))
+
+
+class OneWriter(unittest.TestCase):
+    def test_four_processes_sealing_into_one_book_lose_nothing(self):
+        import subprocess
+        import sys
+        here = os.path.dirname(os.path.dirname(os.path.abspath(spr.__file__)))
+        code = (
+            "import sys; from spr import SprBook\n"
+            "d, who = sys.argv[1], sys.argv[2]\n"
+            "b = SprBook(dir=d, agent_id='agt_many', entity='Example Co')\n"
+            "for k in range(40):\n"
+            "    b.seal(rail='stripe', source_id=f'{who}-{k}', amount_minor=100 + k, currency='USD', occurred_at='2026-10-28T12:00:00Z')\n"
+            "    b.seal(rail='stripe', source_id=f'shared-{k % 10}', amount_minor=1 if who == 'w0' else 2, currency='USD', occurred_at='2026-10-28T12:00:00Z')\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            SprBook(dir=d, agent_id="agt_many", entity="Example Co")
+            ps = [subprocess.Popen([sys.executable, "-c", code, d, w], cwd=here) for w in ["w0", "w1", "w2", "w3"]]
+            self.assertEqual([p.wait() for p in ps], [0, 0, 0, 0])
+            with open(os.path.join(d, "records.jsonl"), encoding="utf-8") as f:
+                rows = [json.loads(l) for l in f if l.strip()]
+            self.assertEqual(len(rows), 4 * 40 + 10)
+            self.assertEqual(len({r["payload"]["record_id"] for r in rows}), len(rows))
+            self.assertTrue(spr.verify_folder(d)["ok"])
+
+
+class Rotation(unittest.TestCase):
+    def test_the_new_key_is_handed_over_and_old_records_still_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            book = SprBook(dir=d, agent_id="agt_rot", entity="Example Co")
+            other = SprBook(dir=d, agent_id="agt_rot", entity="Example Co")
+            r1 = book.seal(rail="stripe", source_id="pi_1", amount_minor=100, currency="USD", occurred_at="2026-10-28T12:00:00Z")
+            r = book.rotate_key(reason="Yearly rotation")
+            self.assertTrue(book.verify_record(r1["record_id"])["ok"])
+            r2 = other.seal(rail="stripe", source_id="pi_2", amount_minor=100, currency="USD", occurred_at="2026-10-28T12:00:00Z")
+            self.assertEqual(r2["seal"]["key_id"], r["to"])
+            v = spr.verify_folder(d)
+            self.assertTrue(v["ok"], v)
+            self.assertTrue(any(x["what"] == f"key {r['to']} was handed over by key {r['from']}, which sealed the handover" for x in v["results"]))
+            p = os.path.join(d, "keys.jsonl")
+            with open(p, encoding="utf-8") as f:
+                text = f.read()
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text.replace("Yearly rotation", "Forged"))
+            self.assertFalse(spr.verify_folder(d)["ok"])
+
+
+class LargeBook(unittest.TestCase):
+    def test_parts_each_check_on_their_own(self):
+        import time as _t
+        with tempfile.TemporaryDirectory() as d:
+            book = SprBook(dir=d, agent_id="agt_big", entity="Example Co")
+            for k in range(1500):
+                book.seal(rail="stripe", source_id=f"pi_{k}", amount_minor=100, currency="USD", occurred_at="2026-10-28T12:00:00Z")
+            t = _t.monotonic()
+            for k in range(100):
+                book.seal(rail="stripe", source_id=f"pi_late_{k}", amount_minor=1, currency="USD", occurred_at="2026-10-28T12:00:00Z")
+            self.assertLess(_t.monotonic() - t, 5)
+            parts = book.package_parts(max_records=500)
+            self.assertEqual(len(parts), 4)
+            for p in parts:
+                self.assertTrue(spr.verify_package(lambda n, p=p: p[n].encode() if n in p else None)["ok"])
