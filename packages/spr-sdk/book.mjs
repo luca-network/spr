@@ -21,6 +21,7 @@ import { realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import * as L from "@luca-network/spr";
+import { buildAccountingExport, writeAccountingExport } from "./export.mjs";
 
 export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.3" };
 const RECORD_SCHEMA = "luca.record/0.7";   // SPR section 6; the hosted service seals the same schema
@@ -498,6 +499,50 @@ export class SprBook {
     for (const [n, text] of Object.entries(files)) writeFileSync(join(outDir, n), text);
     const check = L.verifyPackage((n) => existsSync(join(outDir, n)) ? readFileSync(join(outDir, n)) : null);
     return { folder: outDir, files: Object.keys(files), verified: check.ok, passed: check.passed, failed: check.failed };
+  }
+
+  // Accounting export: the signed SPR package plus accounting CSV files in a single output folder.
+  // The SPR package is written unchanged by exportPackage(); accounting files are added alongside.
+  // opts: { overwrite, companyProfile, companyMapping, classificationContext }
+  exportAccountingPackage(outDir, opts = {}) {
+    const out = resolve(outDir);
+    if (out === resolve(this.dir)) throw new Error("Export to a folder of its own, outside the book's folder, which holds the private key");
+    // Write the signed SPR package first (unchanged)
+    const sprResult = this.exportPackage(outDir, { overwrite: opts.overwrite });
+    // Read the manifest sha256 from what was just written
+    const manifestPath = join(outDir, "manifest.json");
+    let sprManifestSha256 = null;
+    try {
+      const raw = readFileSync(manifestPath, "utf8");
+      sprManifestSha256 = L.sha256Hex(Buffer.from(raw, "utf8"));
+    } catch {}
+    // Get current records (current version only for accounting; all versions are in the SPR package)
+    const currentRecords = this.current();
+    // Build accounting export
+    const { files, stats } = buildAccountingExport(
+      currentRecords,
+      this.keyring,
+      {
+        export_id: `ae_${iso(this.now()).replace(/[^0-9]/g, "").slice(0, 14)}`,
+        generated_at: iso(this.now()),
+        entity: this.cfg.entity,
+        spr_manifest_sha256: sprManifestSha256,
+        companyProfile: opts.companyProfile ?? { industry: "general" },
+        companyMapping: opts.companyMapping ?? {},
+        classificationContext: opts.classificationContext ?? {},
+        verifySeal: (payload, seal, keyring) => {
+          const s = L.normalizeSeal(seal ?? {});
+          const k = keyring instanceof Map ? keyring.get(s.key_id) : keyring?.[s.key_id];
+          if (!k) return { ok: false, hash_matches: false, signature_valid: false, core_fields_ok: false };
+          const v = L.verifySeal(payload, seal, k.public_pem, k.algorithm ?? s.algorithm);
+          const core = L.checkRecord(payload);
+          return { ...v, ok: v.ok && core.ok, core_fields_ok: core.ok, problems: core.problems };
+        },
+      }
+    );
+    // Write accounting files alongside the SPR package
+    writeAccountingExport(outDir, files, { overwrite: true });
+    return { ...sprResult, ...stats, accounting_files: Object.keys(files) };
   }
 
   // ---- the key ----
