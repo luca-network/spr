@@ -120,13 +120,9 @@ export function generateDraftJournal(record, classification, companyMapping = {}
         break;
 
       case Treatment.INVENTORY:
-        lines = [
-          makeDraftJournalLine({ ...baseFields, line_seq: 1, account_code: debitAccount.code, account_name: debitAccount.name, debit_minor: amt, credit_minor: 0 }),
-          makeDraftJournalLine({ ...baseFields, line_seq: 2, account_code: ap.code, account_name: ap.name, debit_minor: 0, credit_minor: amt }),
-        ];
-        break;
-
       case Treatment.INTERCOMPANY:
+        // INVENTORY: Dr Inventory / Cr AP; INTERCOMPANY: Dr IC Receivable / Cr IC Payable.
+        // Journal line structure is identical; account codes differ per template.
         lines = [
           makeDraftJournalLine({ ...baseFields, line_seq: 1, account_code: debitAccount.code, account_name: debitAccount.name, debit_minor: amt, credit_minor: 0 }),
           makeDraftJournalLine({ ...baseFields, line_seq: 2, account_code: ap.code, account_name: ap.name, debit_minor: 0, credit_minor: amt }),
@@ -170,8 +166,8 @@ function resolveGlAccount(code, name, companyMapping) {
   // Company mapping can override account name; fall back to classification name
   const overrides = companyMapping.gl_accounts ?? {};
   if (overrides[code]) return overrides[code];
-  // Accept the classification's account if no override blocks it
-  if (code && name) return { code, name };
+  // Accept the classification's account if the code is present; an empty name is allowed.
+  if (code) return { code, name: name ?? "" };
   return null;
 }
 

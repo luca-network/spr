@@ -40,7 +40,7 @@ const PRODUCER = { name: "spr-accounting-export", version: "0.1.0" };
  *   companyProfile: { industry, reporting_framework, capitalization_threshold_minor?, jurisdiction? },
  *   companyMapping: { gl_accounts?, ap_account?, bank_account? },
  *   classificationContext: { [record_id]: { delivery_context?, for_resale?, override_categories? } },
- *   verifyRecord: (payload, seal, keyring) => VerificationOutcome,
+ *   verifySeal: (payload, seal, keyring) => VerificationOutcome,
  * }
  */
 export function buildAccountingExport(records, keyring, opts = {}) {
@@ -154,16 +154,13 @@ export function buildAccountingExport(records, keyring, opts = {}) {
     { key: "state",               header: "state" },
     { key: "intent_id",           header: "intent_id" },
     { key: "settlement_confidence", header: "settlement_confidence" },
-    { key: "treatment",           header: "treatment", accessor: (r) => r.classification?.treatment ?? "" },
-    { key: "account_code",        header: "account_code", accessor: (r) => r.classification?.account_code ?? "" },
-    { key: "account_name",        header: "account_name", accessor: (r) => r.classification?.account_name ?? "" },
+    { key: "treatment",           header: "treatment" },
+    { key: "account_code",        header: "account_code" },
+    { key: "account_name",        header: "account_name" },
     { key: "journal_status",      header: "journal_status" },
     { key: "spr_payload_sha256",  header: "spr_payload_sha256" },
     { key: "export_id",           header: "export_id" },
-  ].map((c) => c.accessor
-    ? { key: c.key, header: c.header, numeric: c.numeric }  // handled below
-    : c
-  ), transactions.map((t) => ({
+  ], transactions.map((t) => ({
     ...t,
     treatment:    t.classification?.treatment ?? "",
     account_code: t.classification?.account_code ?? "",

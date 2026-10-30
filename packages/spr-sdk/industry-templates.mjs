@@ -40,9 +40,18 @@ export const INDUSTRY_TEMPLATES = {
       [Treatment.INTERCOMPANY]:      acct("2100", "Intercompany Payable", "ASC 850", "IAS 24"),
     },
     threshold_rules: [
+      // COGS rule evaluated first: any purchase for customer delivery → Cost of Revenue.
+      // This prevents the capitalization rule below from mis-classifying customer-delivery
+      // hardware as a fixed asset instead of COGS.
+      {
+        id: "saas_cogs",
+        description: "Costs billed directly to customers → COGS",
+        applies_when: { delivery_context: "customer_delivery" },
+        treatment: Treatment.COST_OF_REVENUE,
+      },
       {
         id: "saas_capitalization",
-        description: "Hardware/equipment above threshold → fixed asset",
+        description: "Hardware/equipment above threshold → fixed asset (internal use only)",
         applies_to_categories: ["hardware", "equipment", "laptop", "computer", "server"],
         capitalization_threshold_minor: 250000, // $2,500 in cents
         above_threshold_treatment: Treatment.FIXED_ASSET,
@@ -57,12 +66,6 @@ export const INDUSTRY_TEMPLATES = {
         prepaid_threshold_months: 3,
         above_threshold_treatment: Treatment.PREPAID_ASSET,
         below_threshold_treatment: Treatment.OPERATING_EXPENSE,
-      },
-      {
-        id: "saas_cogs",
-        description: "Data / API costs billed directly to customers → COGS",
-        applies_when: { delivery_context: "customer_delivery" },
-        treatment: Treatment.COST_OF_REVENUE,
       },
     ],
   },
@@ -82,17 +85,17 @@ export const INDUSTRY_TEMPLATES = {
     },
     threshold_rules: [
       {
+        id: "media_cogs",
+        applies_when: { delivery_context: "customer_delivery" },
+        treatment: Treatment.COST_OF_REVENUE,
+      },
+      {
         id: "media_capitalization",
         applies_to_categories: ["equipment", "camera", "hardware"],
         capitalization_threshold_minor: 250000,
         above_threshold_treatment: Treatment.FIXED_ASSET,
         below_threshold_treatment: Treatment.OPERATING_EXPENSE,
         useful_life_years: { min: 3, max: 7 },
-      },
-      {
-        id: "media_cogs",
-        applies_when: { delivery_context: "customer_delivery" },
-        treatment: Treatment.COST_OF_REVENUE,
       },
     ],
   },
@@ -150,18 +153,24 @@ export const INDUSTRY_TEMPLATES = {
     },
     threshold_rules: [
       {
+        id: "ps_cogs_data",
+        applies_to_categories: ["data", "api", "market_data"],
+        applies_when: { delivery_context: "customer_delivery" },
+        treatment: Treatment.COST_OF_REVENUE,
+      },
+      {
+        id: "ps_cogs_all",
+        description: "Any purchase for customer delivery → COGS",
+        applies_when: { delivery_context: "customer_delivery" },
+        treatment: Treatment.COST_OF_REVENUE,
+      },
+      {
         id: "ps_capitalization",
         applies_to_categories: ["equipment", "hardware", "laptop", "computer"],
         capitalization_threshold_minor: 250000,
         above_threshold_treatment: Treatment.FIXED_ASSET,
         below_threshold_treatment: Treatment.OPERATING_EXPENSE,
         useful_life_years: { min: 3, max: 5 },
-      },
-      {
-        id: "ps_cogs_data",
-        applies_to_categories: ["data", "api", "market_data"],
-        applies_when: { delivery_context: "customer_delivery" },
-        treatment: Treatment.COST_OF_REVENUE,
       },
     ],
   },
@@ -181,12 +190,10 @@ export const INDUSTRY_TEMPLATES = {
     },
     threshold_rules: [
       {
-        id: "retail_capitalization",
-        applies_to_categories: ["equipment", "hardware"],
-        capitalization_threshold_minor: 250000,
-        above_threshold_treatment: Treatment.FIXED_ASSET,
-        below_threshold_treatment: Treatment.OPERATING_EXPENSE,
-        useful_life_years: { min: 3, max: 10 },
+        id: "retail_cogs_data",
+        applies_to_categories: ["data", "api"],
+        applies_when: { delivery_context: "customer_delivery" },
+        treatment: Treatment.COST_OF_REVENUE,
       },
       {
         id: "retail_inventory",
@@ -195,10 +202,12 @@ export const INDUSTRY_TEMPLATES = {
         treatment: Treatment.INVENTORY,
       },
       {
-        id: "retail_cogs_data",
-        applies_to_categories: ["data", "api"],
-        applies_when: { delivery_context: "customer_delivery" },
-        treatment: Treatment.COST_OF_REVENUE,
+        id: "retail_capitalization",
+        applies_to_categories: ["equipment", "hardware"],
+        capitalization_threshold_minor: 250000,
+        above_threshold_treatment: Treatment.FIXED_ASSET,
+        below_threshold_treatment: Treatment.OPERATING_EXPENSE,
+        useful_life_years: { min: 3, max: 10 },
       },
     ],
   },
@@ -218,18 +227,24 @@ export const INDUSTRY_TEMPLATES = {
     },
     threshold_rules: [
       {
+        id: "finserv_cogs_data",
+        applies_to_categories: ["data", "market_data", "api", "feed"],
+        applies_when: { delivery_context: "customer_delivery" },
+        treatment: Treatment.COST_OF_REVENUE,
+      },
+      {
+        id: "finserv_cogs_all",
+        description: "Any purchase for customer delivery → COGS",
+        applies_when: { delivery_context: "customer_delivery" },
+        treatment: Treatment.COST_OF_REVENUE,
+      },
+      {
         id: "finserv_capitalization",
         applies_to_categories: ["hardware", "server", "infrastructure"],
         capitalization_threshold_minor: 250000,
         above_threshold_treatment: Treatment.FIXED_ASSET,
         below_threshold_treatment: Treatment.OPERATING_EXPENSE,
         useful_life_years: { min: 3, max: 7 },
-      },
-      {
-        id: "finserv_cogs_data",
-        applies_to_categories: ["data", "market_data", "api", "feed"],
-        applies_when: { delivery_context: "customer_delivery" },
-        treatment: Treatment.COST_OF_REVENUE,
       },
     ],
   },
@@ -249,17 +264,17 @@ export const INDUSTRY_TEMPLATES = {
     },
     threshold_rules: [
       {
+        id: "general_cogs",
+        applies_when: { delivery_context: "customer_delivery" },
+        treatment: Treatment.COST_OF_REVENUE,
+      },
+      {
         id: "general_capitalization",
         applies_to_categories: ["hardware", "equipment", "laptop", "computer", "server"],
         capitalization_threshold_minor: 250000,
         above_threshold_treatment: Treatment.FIXED_ASSET,
         below_threshold_treatment: Treatment.OPERATING_EXPENSE,
         useful_life_years: { min: 3, max: 5 },
-      },
-      {
-        id: "general_cogs",
-        applies_when: { delivery_context: "customer_delivery" },
-        treatment: Treatment.COST_OF_REVENUE,
       },
     ],
   },

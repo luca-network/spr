@@ -46,7 +46,7 @@ export function inferCategories(text = "") {
 export function validateCompanyProfile(profile = {}) {
   const problems = [];
   if (!profile.industry) problems.push("company_profile.industry is required for classification");
-  if (!INDUSTRY_TEMPLATES[profile.industry]) problems.push(`Unknown industry: ${profile.industry}`);
+  else if (!INDUSTRY_TEMPLATES[profile.industry]) problems.push(`Unknown industry: ${profile.industry}`);
   const framework = profile.reporting_framework ?? "US_GAAP";
   if (!["US_GAAP", "IFRS", "OTHER"].includes(framework)) problems.push(`Unknown reporting_framework: ${framework}`);
   return { ok: problems.length === 0, problems, framework };
@@ -134,10 +134,25 @@ export function classify(record, context = {}, companyProfile = {}) {
       break;
     }
 
-    // Prepaid rule
+    // Prepaid rule: requires subscription period to determine above/below threshold.
+    // Without it, use the conservative below_threshold_treatment (typically OPERATING_EXPENSE)
+    // and emit an advisory exception so the reviewer can supply the period.
     if (rule.prepaid_threshold_months !== undefined) {
-      selectedTreatment = rule.above_threshold_treatment; // simplified: mark as prepaid when category matches
+      const periodMonths = context.subscription_period_months ?? null;
+      selectedTreatment = (periodMonths !== null && periodMonths >= rule.prepaid_threshold_months)
+        ? rule.above_threshold_treatment
+        : rule.below_threshold_treatment;
       appliedRuleId = rule.id;
+      if (periodMonths === null) {
+        exceptions.push(makeExceptionRecord({
+          record_id: recordId, spr_payload_sha256: digest,
+          exception_type: "missing_context",
+          message: `subscription_period_months is required to determine prepaid vs. expense treatment (threshold: ${rule.prepaid_threshold_months} months). Defaulting to ${selectedTreatment}.`,
+          details: { rule_id: rule.id, prepaid_threshold_months: rule.prepaid_threshold_months },
+          requires_action: false,
+          export_id: exportId,
+        }));
+      }
       break;
     }
 

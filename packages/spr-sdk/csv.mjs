@@ -7,7 +7,9 @@
 
 // Characters that, if at the start of a cell, would be interpreted as formulas
 // by Excel/Sheets. We prefix the cell with a space to defuse them.
-const FORMULA_CHARS = new Set(["=", "+", "-", "@", "\t", "\r"]);
+// Note: \r is NOT included — it is not a formula trigger and is handled separately
+// by the quoting path below, so including it here would corrupt leading-\r values.
+const FORMULA_CHARS = new Set(["=", "+", "-", "@", "\t"]);
 
 /**
  * Escape a single CSV cell value.

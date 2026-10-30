@@ -515,7 +515,10 @@ export class SprBook {
     try {
       const raw = readFileSync(manifestPath, "utf8");
       sprManifestSha256 = L.sha256Hex(Buffer.from(raw, "utf8"));
-    } catch {}
+    } catch (e) {
+      // manifest unreadable after write; accounting manifest cross-reference will be null
+      console.warn(`SPR accounting export: could not read manifest.json for cross-reference hash: ${e.message}`);
+    }
     // Get current records (current version only for accounting; all versions are in the SPR package)
     const currentRecords = this.current();
     // Build accounting export
@@ -523,7 +526,7 @@ export class SprBook {
       currentRecords,
       this.keyring,
       {
-        export_id: `ae_${iso(this.now()).replace(/[^0-9]/g, "").slice(0, 14)}`,
+        export_id: `ae_${iso(this.now()).replace(/[^0-9]/g, "").slice(0, 14)}_${randomBytes(4).toString("hex")}`,
         generated_at: iso(this.now()),
         entity: this.cfg.entity,
         spr_manifest_sha256: sprManifestSha256,
