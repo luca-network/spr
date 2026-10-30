@@ -78,6 +78,6 @@ This is draft 1 of the format and version 0.1 of the libraries. We expect to cha
 
 ## Licence
 
-Apache License 2.0. See `LICENSE` and the front page of `SPEC.md`.
+Apache License 2.0 for the code: see `LICENSE`. Luca's patent commitment, which lets anyone implement the format with or without this code, is in `PATENTS.md`.
 
 Luca (luca.network) uses SPR for its hosted accounting of agent payments. That covers reading the rails, classifying to US GAAP and IFRS, posting to the ERP, labels agreed with counterparties, and the close.

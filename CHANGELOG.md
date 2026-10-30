@@ -2,6 +2,13 @@
 
 Versions apply to all four packages together: `@luca-network/spr`, `@luca-network/spr-sdk`, `@luca-network/spr-mcp` and `spr-sdk` for Python. The format is draft 1 throughout (`spr/draft-1`); a book written by any of these versions opens in any other.
 
+## 0.1.4 (30 October 2026)
+
+No change to the code or the format. Upgrading is optional.
+
+- **Patent commitment.** `PATENTS.md` is now in the repository and in every package. Luca commits not to assert its patents against any implementation of SPR, with or without this code. The commitment ends for anyone who brings a patent claim against an implementation of SPR. The front page of `SPEC.md` points to it.
+- **Author.** The packages name Luca as their author.
+
 ## 0.1.3 (28 October 2026)
 
 Fixes from an independent security review of 0.1.1. Upgrade.
