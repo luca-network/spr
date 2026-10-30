@@ -23,7 +23,7 @@ import { createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto"
 import * as L from "@luca-network/spr";
 import { buildAccountingExport, writeAccountingExport } from "./export.mjs";
 
-export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.3" };
+export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.4" };
 const RECORD_SCHEMA = "luca.record/0.7";   // SPR section 6; the hosted service seals the same schema
 const INTENT_SCHEMA = "luca.intent/0.1";
 const CLOCK_SKEW_MS = 2 * 60_000;

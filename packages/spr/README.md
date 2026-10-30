@@ -24,4 +24,4 @@ The library runs wherever you run it and makes no call to Luca. Luca's hosted se
 
 ## Licence
 
-Apache License 2.0 (`LICENSE`), which includes a patent licence from each contributor for this code. Methods in the format are the subject of a US provisional patent application assigned to Luca Africa Inc.; a royalty-free commitment for implementations written without this code is published with the format (`SPEC.md`, the front page).
+Apache License 2.0 (`LICENSE`), which includes a patent licence from each contributor for this code. Methods in the format are patent pending; Luca's commitment in `PATENTS.md` lets anyone implement the format, with or without this code, without a patent licence.
