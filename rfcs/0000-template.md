@@ -35,4 +35,4 @@ Other ways to solve the problem, and why this one.
 
 ## Decision
 
-Filled in by the editors, with reasons.
+Filled in by the editor, with reasons.

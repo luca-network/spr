@@ -13,7 +13,7 @@ This repository holds the format and its reference implementation only. Products
 
 ## How changes reach the repository
 
-This repository is published from Luca's maintained source with each release. An accepted pull request is applied by the editors to that source and appears in the next release, with your authorship kept in the commit. Please do not expect a pull request to be merged directly.
+This repository is published from Luca's maintained source with each release. An accepted pull request is applied by Luca's editor to that source and appears in the next release, with your authorship kept in the commit. Please do not expect a pull request to be merged directly.
 
 ## Sign-off
 
