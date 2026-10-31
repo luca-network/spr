@@ -1,6 +1,7 @@
 {
   "name": "@luca-network/spr-mcp",
-  "version": "0.1.4",
+  "mcpName": "network.luca/spr-mcp",
+  "version": "0.1.5",
   "description": "SPR as an MCP server: AI agents declare, check and seal each payment, with your company's own key, on your own machine",
   "license": "Apache-2.0",
   "author": "Luca <hello@luca.network>",
@@ -12,6 +13,6 @@
   "bin": { "spr-mcp": "bin/spr-mcp.mjs" },
   "files": ["server.mjs", "server.d.mts", "bin", "README.md", "LICENSE", "NOTICE", "PATENTS.md"],
   "engines": { "node": ">=20" },
-  "dependencies": { "@luca-network/spr-sdk": "0.1.4", "@modelcontextprotocol/sdk": "1.32.2" },
+  "dependencies": { "@luca-network/spr-sdk": "0.1.5", "@modelcontextprotocol/sdk": "1.32.2" },
   "publishConfig": { "access": "public" }
 }

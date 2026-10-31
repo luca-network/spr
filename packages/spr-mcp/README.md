@@ -20,6 +20,20 @@ Add this to `claude_desktop_config.json`:
 }
 ```
 
+## Cursor
+
+The same block in `.cursor/mcp.json`.
+
+## Claude Code
+
+```
+claude mcp add spr -e SPR_AGENT_ID=agt_research -e SPR_ENTITY="Example Co" -- npx -y @luca-network/spr-mcp
+```
+
+## Agent frameworks
+
+CrewAI, Microsoft Agent Framework, Google ADK and the Claude Agent SDK connect to this server in a few lines: see [`examples/`](https://github.com/luca-network/spr/tree/main/examples). Any other MCP client runs `npx -y @luca-network/spr-mcp` over stdio with `SPR_AGENT_ID` and `SPR_ENTITY` set.
+
 ## Tools
 
 | Tool | What it does |

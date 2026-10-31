@@ -2,6 +2,17 @@
 
 Versions apply to all four packages together: `@luca-network/spr`, `@luca-network/spr-sdk`, `@luca-network/spr-mcp` and `spr-sdk` for Python. The format is draft 1 throughout (`spr/draft-1`); a book written by any of these versions opens in any other.
 
+## 0.1.5 (30 October 2026)
+
+No change to the format or to what a record holds. Upgrading is optional.
+
+- **Setup for more tools.** The README opens with what SPR is for, then a setup for Claude Desktop, Claude Code, Cursor, the OpenAI Agents SDK, LangChain and any MCP client.
+- **Examples.** `examples/` connects CrewAI, Microsoft Agent Framework, Google ADK and the Claude Agent SDK to the MCP server.
+- **Clearer tool descriptions.** Each tool's description now says when an agent should call it, so a model picks the right one.
+- **MCP Registry.** `server.json` describes the MCP server for the official MCP Registry, and the package carries its registry name (`mcpName`).
+- **`MAINTAINERS.md`.** Who maintains SPR now, and the path for someone outside Luca to become a reviewer, then a maintainer with commit rights.
+- **`llms.txt`.** A short map of the repository for AI assistants.
+
 ## 0.1.4 (30 October 2026)
 
 No change to the code or the format. Upgrading is optional.

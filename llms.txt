@@ -1,0 +1,27 @@
+# SPR: the Sealed Payment Record
+
+> An open format, with free libraries and an MCP server, for recording each payment an AI agent makes: what it declared before paying, what settled and on which rail, sealed with the company's own key on its own machine, and checkable by anyone without trusting a service. Apache-2.0, with a royalty-free patent commitment.
+
+Use SPR when an agent pays for something (x402, Stripe, cards or other rails) and someone needs a record they can check later: finance, an auditor, the counterparty.
+
+## Start
+
+- [README](https://github.com/luca-network/spr/blob/main/README.md): what SPR does and how to run it from Claude Desktop, Claude Code, Cursor and agent frameworks
+- [MCP server](https://github.com/luca-network/spr/blob/main/packages/spr-mcp/README.md): `npx -y @luca-network/spr-mcp`, its tools and settings
+- [JavaScript SDK](https://github.com/luca-network/spr/blob/main/packages/spr-sdk/README.md): `@luca-network/spr-sdk`, including `withLuca(fetch)` for x402
+- [Python SDK](https://github.com/luca-network/spr/blob/main/python/README.md): `pip install spr-sdk`
+- [Examples](https://github.com/luca-network/spr/tree/main/examples): CrewAI, Microsoft Agent Framework, Google ADK, Claude Agent SDK
+
+## Tools an agent calls
+
+- `record_intent`: call first, just before paying, with the purpose and the most it may pay (amounts in minor units: cents, or 6 decimals for USDC)
+- `check_payment`: call before paying; if it declines, do not pay
+- `record_settlement`: call after paying, with the rail's own reference and the time it settled
+- `cancel_intent`: withdraw an intent that will not be paid
+- `get_intent`, `verify_record`, `list_records`, `export_package`: read and check the book
+
+## Format
+
+- [Specification](https://github.com/luca-network/spr/blob/main/SPEC.md): draft 1
+- [Test vectors](https://github.com/luca-network/spr/blob/main/packages/spr/vectors/vectors.json): an implementation conforms when it gives the same answers
+- [Governance](https://github.com/luca-network/spr/blob/main/GOVERNANCE.md), [maintainers](https://github.com/luca-network/spr/blob/main/MAINTAINERS.md) and [patent commitment](https://github.com/luca-network/spr/blob/main/PATENTS.md)

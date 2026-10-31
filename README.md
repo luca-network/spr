@@ -1,6 +1,45 @@
 # SPR: the Sealed Payment Record
 
-SPR is an open format for the accounting record of a payment made or received by an AI agent. The company that makes the record seals it with its own key, and anyone holding the company's public key can check it. No service has to be trusted, Luca's included.
+Your AI agent pays for data, compute and services, and your finance team and auditor can't see what each payment was for. SPR records every payment your agent makes, before and after it pays, sealed with your company's own key on your own machine. Anyone can check the seals. No service has to be trusted, Luca's included.
+
+```
+npx -y @luca-network/spr-mcp
+```
+
+Free and open: Apache-2.0, with a royalty-free patent commitment ([`PATENTS.md`](PATENTS.md)).
+
+## Use it from your AI tool
+
+Every setup below runs the same MCP server on your machine. Set `SPR_AGENT_ID` (your agent) and `SPR_ENTITY` (the company it pays for); records go to `SPR_DIR`.
+
+**Claude Desktop**: add to `claude_desktop_config.json`:
+
+```json
+{ "mcpServers": { "spr": { "command": "npx", "args": ["-y", "@luca-network/spr-mcp"],
+  "env": { "SPR_AGENT_ID": "agt_research", "SPR_ENTITY": "Example Co", "SPR_DIR": "/Users/you/spr-books" } } } }
+```
+
+**Cursor**: the same block in `.cursor/mcp.json`.
+
+**Claude Code**:
+
+```
+claude mcp add spr -e SPR_AGENT_ID=agt_research -e SPR_ENTITY="Example Co" -- npx -y @luca-network/spr-mcp
+```
+
+**OpenAI Agents SDK** and **LangChain** (JavaScript):
+
+```js
+import { SprBook, toOpenAIAgentsTools, toLangChainTools } from "@luca-network/spr-sdk";
+const book = new SprBook({ dir: "./books", agentId: "agt_research", entity: "Example Co" });
+const tools = toOpenAIAgentsTools(book, tool);   // tool from "@openai/agents"; or toLangChainTools(book, tool)
+```
+
+**CrewAI, Microsoft Agent Framework, Google ADK and the Claude Agent SDK** (Python): each connects to the MCP server in a few lines. See [`examples/`](examples).
+
+**Any other MCP client**: run `npx -y @luca-network/spr-mcp` over stdio with the two settings above.
+
+The agent then calls `record_intent` before it pays, `check_payment` to see whether the payment is inside what it declared, and `record_settlement` after it pays. Each record is sealed in the book's folder.
 
 A record shows:
 - what the agent declared before it paid: the purpose, the most it could spend, and when the permission expired;

@@ -1,6 +1,6 @@
 {
   "name": "@luca-network/spr",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "SPR, the Sealed Payment Record: make and check sealed accounting records of AI agent payments, with no dependencies",
   "license": "Apache-2.0",
   "author": "Luca <hello@luca.network>",

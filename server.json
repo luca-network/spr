@@ -1,0 +1,59 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "network.luca/spr-mcp",
+  "title": "SPR (Sealed Payment Record)",
+  "description": "Seal every payment your AI agent makes as a signed record, on your own machine, with your key.",
+  "repository": {
+    "url": "https://github.com/luca-network/spr",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/luca-network/spr",
+  "version": "0.1.5",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@luca-network/spr-mcp",
+      "version": "0.1.5",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SPR_AGENT_ID",
+          "description": "The agent's ID, such as agt_research",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "SPR_ENTITY",
+          "description": "The company the agent pays for",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "SPR_DIR",
+          "description": "The book's folder (default ./spr-books); it holds the company's private key",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "SPR_TIME_ZONE",
+          "description": "The company's time zone for accounting dates (default UTC)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "SPR_BINDING",
+          "description": "on, to return the nonce to sign with each x402 intent",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
