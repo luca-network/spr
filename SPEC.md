@@ -8,13 +8,13 @@ The words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
 **Names inside the format.** The identifiers a record carries keep the names they were first sealed with: `luca.record`, `luca.intent`, `luca.label/1`, `luca.seal/1` and `luca.intent-nonce/1`. They sit inside every seal and every nonce already made, so renaming them would change every hash. They identify the format's schemas and say nothing about who made a record.
 
-**Licence.** The reference library, the checker and the test vectors are released under the Apache License 2.0, which includes a patent licence for that code. The methods in sections 5 and 7 and the audit package in section 8 are patent pending. Luca will not assert those patents against any implementation of this format, including one written without the reference code, on the terms in `PATENTS.md`. The commitment ends for anyone who brings a patent claim against an implementation of this format.
+**License.** The reference library, the checker and the test vectors are released under the Apache License 2.0, which includes a patent license for that code. The methods in sections 5 and 7 and the audit package in section 8 are patent pending. Luca will not assert those patents against any implementation of this format, including one written without the reference code, on the terms in `PATENTS.md`. The commitment ends for anyone who brings a patent claim against an implementation of this format.
 
 **SPR-compatible.** An implementation may describe itself as SPR-compatible when it passes every vector of the draft it names.
 
 ## 1. Canonical JSON
 
-Every sealed object is serialised as canonical JSON before it is hashed or signed. The rules are those of RFC 8785 (JSON Canonicalization Scheme) for the value types the format allows:
+Every sealed object is serialized as canonical JSON before it is hashed or signed. The rules are those of RFC 8785 (JSON Canonicalization Scheme) for the value types the format allows:
 
 - strings, written as ECMAScript's `JSON.stringify` writes them;
 - integers, which MUST be safe integers (between −(2^53 − 1) and 2^53 − 1). A number with a fraction MUST be rejected, never rounded. Money is always an integer count of the currency's minor unit;

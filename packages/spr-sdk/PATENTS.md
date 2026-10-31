@@ -1,6 +1,6 @@
 # Patent commitment for SPR
 
-Luca, the publisher of SPR at github.com/luca-network/spr and luca.network, makes this commitment so that anyone can implement SPR, the Sealed Payment Record, with or without Luca's reference code, without needing a patent licence from Luca.
+Luca, the publisher of SPR at github.com/luca-network/spr and luca.network, makes this commitment so that anyone can implement SPR, the Sealed Payment Record, with or without Luca's reference code, without needing a patent license from Luca.
 
 ## The commitment
 
@@ -23,8 +23,8 @@ The commitment ends for you, and for any company you control or that controls yo
 - **It binds Luca's successors.** It binds anyone to whom Luca transfers a Covered Claim, and anyone who takes over Luca's business.
 - **It needs nothing from you.** You do not have to sign anything, register, or tell Luca that you rely on it.
 - **It is about patents only.** It grants no trademark rights, including in the names Luca and SPR, and no rights in any other patent.
-- **The code has its own licence.** The reference library, the checker and the test vectors are licensed separately under the Apache License 2.0 (`LICENSE`), which includes its own patent licence for that code. This commitment adds to that licence and does not change it.
+- **The code has its own license.** The reference library, the checker and the test vectors are licensed separately under the Apache License 2.0 (`LICENSE`), which includes its own patent license for that code. This commitment adds to that license and does not change it.
 - **It makes no promise about the code.** Luca gives no warranty that an implementation does not infringe someone else's patents.
-- **Liability.** To the fullest extent the law allows, Luca is not liable for any damages of any kind arising from this commitment, from the specification, or from implementing it. Where the law does not allow that exclusion, Luca's total liability to any person or organisation, worldwide and for all claims together, will not exceed US$9.99.
+- **Liability.** To the fullest extent the law allows, Luca is not liable for any damages of any kind arising from this commitment, from the specification, or from implementing it. Where the law does not allow that exclusion, Luca's total liability to any person or organization, worldwide and for all claims together, will not exceed US$9.99.
 
 Published 30 October 2026. Questions: hello@luca.network.

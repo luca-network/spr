@@ -76,7 +76,7 @@ What changed in each version, and what you may need to change on upgrading: [`CH
 
 This is draft 1 of the format and version 0.1 of the libraries. We expect to change things as people use them. Tell us what breaks or what's missing: open an issue, or write to hello@luca.network.
 
-## Licence
+## License
 
 Apache License 2.0 for the code: see `LICENSE`. Luca's patent commitment, which lets anyone implement the format with or without this code, is in `PATENTS.md`.
 

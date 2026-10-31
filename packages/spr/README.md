@@ -22,6 +22,6 @@ node bin/spr-verify.mjs <package folder>   # a package, with no Luca code
 
 The library runs wherever you run it and makes no call to Luca. Luca's hosted service seals with the same library.
 
-## Licence
+## License
 
-Apache License 2.0 (`LICENSE`), which includes a patent licence from each contributor for this code. Methods in the format are patent pending; Luca's commitment in `PATENTS.md` lets anyone implement the format, with or without this code, without a patent licence.
+Apache License 2.0 (`LICENSE`), which includes a patent license from each contributor for this code. Methods in the format are patent pending; Luca's commitment in `PATENTS.md` lets anyone implement the format, with or without this code, without a patent license.
