@@ -1,6 +1,6 @@
 {
   "name": "@luca-network/spr-sdk",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Seal AI agent payments as SPR records locally, with your company's own key: x402, OpenAI Agents SDK, LangChain",
   "license": "Apache-2.0",
   "author": "Luca <hello@luca.network>",
@@ -8,13 +8,16 @@
   "repository": { "type": "git", "url": "git+https://github.com/luca-network/spr.git", "directory": "packages/spr-sdk" },
   "keywords": ["ai-agents", "payments", "x402", "accounting", "mcp", "langchain", "openai-agents"],
   "type": "module",
+  "main": "./index.mjs",
+  "types": "./index.d.mts",
   "exports": {
     ".": { "types": "./index.d.mts", "default": "./index.mjs" },
-    "./x402": { "types": "./x402.d.mts", "default": "./x402.mjs" }
+    "./x402": { "types": "./x402.d.mts", "default": "./x402.mjs" },
+    "./package.json": "./package.json"
   },
   "files": ["index.mjs", "index.d.mts", "book.mjs", "tools.mjs", "x402.mjs", "x402.d.mts", "README.md", "LICENSE", "NOTICE", "PATENTS.md"],
   "engines": { "node": ">=20" },
-  "dependencies": { "@luca-network/spr": "0.1.5" },
+  "dependencies": { "@luca-network/spr": "0.1.6" },
   "peerDependencies": { "@x402/fetch": ">=2.28.0", "@x402/evm": ">=2.28.0", "@x402/core": ">=2.28.0", "viem": ">=2.0.0" },
   "peerDependenciesMeta": { "@x402/fetch": { "optional": true }, "@x402/evm": { "optional": true }, "@x402/core": { "optional": true }, "viem": { "optional": true } },
   "publishConfig": { "access": "public" }

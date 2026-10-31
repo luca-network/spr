@@ -34,6 +34,10 @@ claude mcp add spr -e SPR_AGENT_ID=agt_research -e SPR_ENTITY="Example Co" -- np
 
 CrewAI, Microsoft Agent Framework, Google ADK and the Claude Agent SDK connect to this server in a few lines: see [`examples/`](https://github.com/luca-network/spr/tree/main/examples). Any other MCP client runs `npx -y @luca-network/spr-mcp` over stdio with `SPR_AGENT_ID` and `SPR_ENTITY` set.
 
+## Requirements
+
+Node.js 20 or later. The packages are ES modules: load them with `import`, not `require`.
+
 ## Tools
 
 | Tool | What it does |

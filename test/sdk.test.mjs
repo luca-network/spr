@@ -408,3 +408,52 @@ test("sending to Luca: only https, plain http only to this computer when asked, 
     assert.throws(() => book.exportPackage(join(dir, "book")), /outside the book's folder/);
   } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
 });
+
+test("a crash part way through a write: the unfinished line is set aside, the next record seals, and the book opens", async () => {
+  const { appendFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "spr-torn-"));
+  try {
+    const at = "2026-10-31T12:00:00Z";
+    new SprBook({ dir, agentId: "agt_torn", entity: "Example Co" }).seal({ rail: "stripe", source_id: "pi_one", amount_minor: 100, currency: "USD", occurred_at: at });
+    appendFileSync(join(dir, "records.jsonl"), '{"payload":{"record_id":"LR-HALF');   // the process stopped here
+    const b = new SprBook({ dir, agentId: "agt_torn", entity: "Example Co" });
+    assert.equal(b.seal({ rail: "stripe", source_id: "pi_two", amount_minor: 200, currency: "USD", occurred_at: at }).status, "recorded");
+    const lines = readFileSync(join(dir, "records.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(lines.length, 2);
+    assert.equal(readFileSync(join(dir, "records.jsonl.torn"), "utf8"), '{"payload":{"record_id":"LR-HALF\n');
+    assert.equal(new SprBook({ dir, agentId: "agt_torn", entity: "Example Co" }).listRecords().length, 2);
+    const read = (n) => existsSync(join(dir, n)) ? readFileSync(join(dir, n)) : null;
+    assert.equal(spr.verifyPackage(read).ok, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a lock left by a process that has ended is taken back at once", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const { spawnSync } = await import("node:child_process");
+  const { hostname } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "spr-lock-"));
+  try {
+    const b = new SprBook({ dir, agentId: "agt_lock", entity: "Example Co" });
+    const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+    writeFileSync(join(dir, "book.lock"), JSON.stringify({ pid: gone, host: hostname(), at: new Date().toISOString() }));
+    const t0 = Date.now();
+    assert.equal(b.seal({ rail: "stripe", source_id: "pi_lock", amount_minor: 100, currency: "USD", occurred_at: "2026-10-31T12:00:00Z" }).status, "recorded");
+    assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0} ms`);
+    assert.equal(existsSync(join(dir, "book.lock")), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("export_package refuses an export folder that is a link", async () => {
+  const { mkdirSync, symlinkSync } = await import("node:fs");
+  const { mcpTools } = await import("@luca-network/spr-mcp");
+  const dir = mkdtempSync(join(tmpdir(), "spr-link-"));
+  try {
+    const book = new SprBook({ dir: join(dir, "book"), agentId: "agt_link", entity: "Example Co" });
+    const root = join(dir, "exports"), elsewhere = join(dir, "elsewhere");
+    mkdirSync(root); mkdirSync(elsewhere);
+    symlinkSync(elsewhere, join(root, "audit"), process.platform === "win32" ? "junction" : "dir");
+    const exp = mcpTools(book, { exportDir: root }).find((t) => t.name === "export_package");
+    assert.throws(() => exp.run({ name: "audit" }), /is a link/);
+    assert.equal(exp.run({ name: "audit-2" }).verified, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

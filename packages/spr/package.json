@@ -1,6 +1,6 @@
 {
   "name": "@luca-network/spr",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "SPR, the Sealed Payment Record: make and check sealed accounting records of AI agent payments, with no dependencies",
   "license": "Apache-2.0",
   "author": "Luca <hello@luca.network>",
@@ -10,7 +10,7 @@
   "type": "module",
   "main": "./index.mjs",
   "types": "./index.d.mts",
-  "exports": { ".": { "types": "./index.d.mts", "default": "./index.mjs" }, "./vectors": "./vectors/vectors.json" },
+  "exports": { ".": { "types": "./index.d.mts", "default": "./index.mjs" }, "./vectors": "./vectors/vectors.json", "./package.json": "./package.json" },
   "bin": { "spr-verify": "bin/spr-verify.mjs" },
   "files": ["index.mjs", "index.d.mts", "bin", "vectors", "README.md", "LICENSE", "NOTICE", "PATENTS.md"],
   "engines": { "node": ">=20" },

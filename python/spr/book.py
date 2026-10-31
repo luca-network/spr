@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -26,7 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from . import format as L
 
-SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.5"}
+SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.6"}
 RECORD_SCHEMA = "luca.record/0.7"
 INTENT_SCHEMA = "luca.intent/0.1"
 CLOCK_SKEW = timedelta(minutes=2)
@@ -89,6 +90,49 @@ def _zone_for(name: str):
 
 def _payment_key(p):
     return f"{p['entity']}:{p['rail']}:{p['source']['id']}"
+
+
+def _set_aside_torn_tail(path):
+    """A line left unfinished by a crash is moved to <file>.torn, kept as evidence, so the next record starts on a line
+    of its own and the book still opens. Called under the lock, so no other writer is part way through a line."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size == 0:
+        return
+    with open(path, "rb+") as f:
+        f.seek(size - 1)
+        if f.read(1) == b"\n":
+            return
+        f.seek(0)
+        buf = f.read()
+        end = buf.rfind(b"\n") + 1
+        with open(path + ".torn", "ab") as t:
+            t.write(buf[end:] + b"\n")
+        f.truncate(end)
+
+
+def _lock_owner_gone(lock) -> bool:
+    """book.lock taken on this computer by a process that is no longer running. Not checked on Windows, where
+    os.kill would end the process instead of testing it; there the 30-second rule applies."""
+    if os.name == "nt":
+        return False
+    try:
+        with open(lock, encoding="utf-8") as f:
+            info = json.load(f)
+        pid = int(info["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if info.get("host") != socket.gethostname() or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def _line(row) -> str:
@@ -254,12 +298,18 @@ class SprBook:
             try:
                 fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "w") as f:
-                    f.write(json.dumps({"pid": os.getpid(), "at": _iso(datetime.now(timezone.utc))}))
+                    f.write(json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "at": _iso(datetime.now(timezone.utc))}))
                 break
             except (FileExistsError, PermissionError) as e:
                 # On Windows a lock another process is letting go of can refuse the open with PermissionError for a moment.
                 if isinstance(e, PermissionError) and time.monotonic() > deadline:
                     raise
+                if isinstance(e, FileExistsError) and _lock_owner_gone(lock):
+                    try:
+                        os.remove(lock)
+                    except OSError:
+                        pass
+                    continue
                 try:
                     if time.time() - os.path.getmtime(lock) > LOCK_STALE:
                         os.remove(lock)
@@ -305,8 +355,12 @@ class SprBook:
             self.key, self.key_id = k, L.key_id_for(k)
 
     def _append(self, name, row):
-        with open(os.path.join(self.dir, name), "a", encoding="utf-8", newline="") as f:
+        path = os.path.join(self.dir, name)
+        _set_aside_torn_tail(path)
+        with open(path, "a", encoding="utf-8", newline="") as f:
             f.write(_line(row))
+            f.flush()
+            os.fsync(f.fileno())
         self._refresh()
 
     def _seal_row(self, payload):

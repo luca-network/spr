@@ -7,6 +7,10 @@ The SDK seals at the two moments that matter:
 - **Declare before paying:** what the agent is buying, why, and the most it may pay. This returns the intent's nonce. Signed as the payment's nonce, it makes the rail itself record which intent the payment was made under.
 - **Seal after paying:** the payment, matched to its intent, checked against the intent's window and cap.
 
+## Requirements
+
+Node.js 20 or later. The packages are ES modules: load them with `import`, not `require`.
+
 ## What the book checks
 
 The book runs on your machine and makes no call to Luca. Before and after each payment it checks the payment against the agent's declared intent: the cap, the expiry, and whether the intent was withdrawn.

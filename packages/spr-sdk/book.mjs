@@ -15,14 +15,15 @@
 //   keys.jsonl           its public key, and any earlier ones
 //   intents.jsonl, cancellations.jsonl, checks.jsonl, records.jsonl, labels.jsonl   each sealed: { payload, seal }
 //   mandate.json         optional: the limits the agent acts under (currency, per payment, validity)
-import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, statSync, openSync, readSync, closeSync, rmSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, statSync, openSync, readSync, closeSync, rmSync, renameSync, writeSync, fsyncSync, ftruncateSync } from "node:fs";
+import { hostname } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import * as L from "@luca-network/spr";
 
-export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.5" };
+export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.6" };
 const RECORD_SCHEMA = "luca.record/0.7";   // SPR section 6; the hosted service seals the same schema
 const INTENT_SCHEMA = "luca.intent/0.1";
 const CLOCK_SKEW_MS = 2 * 60_000;
@@ -53,6 +54,30 @@ const FILES = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jso
 // run twice). Each write takes book.lock, reads what the others appended since, writes, and lets go.
 const LOCK_WAIT_MS = 10_000;
 const LOCK_STALE_MS = 30_000;
+
+// A line left unfinished by a crash is moved to <file>.torn, kept as evidence, so the next record starts on a line of
+// its own and the book still opens. Called under the lock, so no other writer is part way through a line.
+function setAsideTornTail(file) {
+  let size; try { size = statSync(file).size; } catch { return; }
+  if (!size) return;
+  const fd = openSync(file, "r+");
+  try {
+    const last = Buffer.alloc(1); readSync(fd, last, 0, 1, size - 1);
+    if (last[0] === 10) return;
+    const buf = Buffer.alloc(size); readSync(fd, buf, 0, size, 0);
+    const end = buf.lastIndexOf(10) + 1;
+    appendFileSync(file + ".torn", Buffer.concat([buf.subarray(end), Buffer.from("\n")]));
+    ftruncateSync(fd, end);
+  } finally { closeSync(fd); }
+}
+// book.lock taken on this computer by a process that is no longer running.
+function lockOwnerGone(lock) {
+  try {
+    const info = JSON.parse(readFileSync(lock, "utf8"));
+    if (info.host !== hostname() || info.pid === process.pid || !Number.isInteger(info.pid)) return false;
+    try { process.kill(info.pid, 0); return false; } catch (e) { return e.code === "ESRCH"; }
+  } catch { return false; }
+}
 const BUSY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 const SLEEP = new Int32Array(new SharedArrayBuffer(4));
 const paymentKey = (p) => `${p.entity}:${p.rail}:${p.source.id}`;
@@ -155,10 +180,11 @@ export class SprBook {
     if (this.lockDepth > 0) { this.lockDepth++; try { return fn(); } finally { this.lockDepth--; } }
     const lock = join(this.dir, "book.lock"), deadline = Date.now() + LOCK_WAIT_MS;
     for (;;) {
-      try { writeFileSync(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { flag: "wx" }); break; }
+      try { writeFileSync(lock, JSON.stringify({ pid: process.pid, host: hostname(), at: new Date().toISOString() }), { flag: "wx" }); break; }
       catch (e) {
         // On Windows a lock another process is letting go of can refuse the open with EPERM or EACCES for a moment.
         if (e.code !== "EEXIST" && !(BUSY_CODES.has(e.code) && Date.now() <= deadline)) throw e;
+        if (e.code === "EEXIST" && lockOwnerGone(lock)) { rmSync(lock, { force: true }); continue; }
         try { if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) { rmSync(lock, { force: true }); continue; } } catch { Atomics.wait(SLEEP, 0, 0, 5); continue; }
         if (Date.now() > deadline) throw new Error(`The book at ${this.dir} is busy: another process has held book.lock for over ${LOCK_WAIT_MS / 1000} seconds. If no other process is using the book, delete book.lock.`);
         Atomics.wait(SLEEP, 0, 0, 20);
@@ -182,7 +208,13 @@ export class SprBook {
       this.key = k; this.keyId = L.keyIdFor(k);
     }
   }
-  append(name, row) { appendFileSync(join(this.dir, name), JSON.stringify(row) + "\n"); this.refresh(); }
+  append(name, row) {
+    const file = join(this.dir, name);
+    setAsideTornTail(file);
+    const fd = openSync(file, "a");
+    try { writeSync(fd, JSON.stringify(row) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+    this.refresh();
+  }
   sealRow(payload) { return { payload, seal: L.sealWith(payload, this.key) }; }
   mandate() {
     const f = join(this.dir, "mandate.json");

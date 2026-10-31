@@ -2,6 +2,16 @@
 
 Versions apply to all four packages together: `@luca-network/spr`, `@luca-network/spr-sdk`, `@luca-network/spr-mcp` and `spr-sdk` for Python. The format is draft 1 throughout (`spr/draft-1`); a book written by any of these versions opens in any other.
 
+## 0.1.6 (31 October 2026)
+
+No change to the format or to what a record holds. Upgrade: this release fixes a way a crash could stop a book opening.
+
+- **A crash while writing no longer breaks the book.** If a process stopped part way through writing a record, the next record was written onto the end of the unfinished line and the book no longer opened. Before each write, an unfinished last line is now moved to a file beside it (`records.jsonl.torn`, for example), kept as evidence, and each record is flushed to disk before the write counts as done. In JavaScript and Python.
+- **A lock left by a crashed process is taken back at once.** `book.lock` now names the computer as well as the process. When that process is no longer running on this computer, the next writer takes the lock straight away instead of after 30 seconds. On Windows, Python keeps the 30-second rule.
+- **Exports refuse a link.** `export_package` refuses an export folder that is a symbolic link, so an export can't be redirected outside the export folder.
+- **Tool annotations.** The MCP tools now say which ones give the same answer when called again (`idempotentHint`): `record_settlement`, `cancel_intent` and `send_to_luca`.
+- **Package metadata.** `@luca-network/spr-sdk` and `@luca-network/spr-mcp` add top-level `main` and `types`, and all three packages export `./package.json`, for tools that read it. The packages are ES modules for Node.js 20 or later, as the READMEs now say.
+
 ## 0.1.5 (30 October 2026)
 
 No change to the format or to what a record holds. Upgrading is optional.

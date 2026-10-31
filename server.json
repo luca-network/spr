@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/luca-network/spr",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@luca-network/spr-mcp",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "transport": {
         "type": "stdio"
       },
