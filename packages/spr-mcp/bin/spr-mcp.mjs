@@ -8,6 +8,8 @@
 //   SPR_TIME_ZONE  the company's time zone for accounting dates (default UTC)
 //   SPR_BINDING    "on" to return the nonce to sign with each intent
 //   SPR_EXPORT_DIR the folder exports go under (default: the book's exports folder)
+//   SPR_AGENT_TYPE, SPR_AGENT_PROVIDER, SPR_AGENT_VERSION, SPR_ENTITY_TYPE, SPR_ENTITY_ID (scheme:value)
+//                  optional facts for the Machine Payment Profile, sealed with each intent and record
 //   LUCA_URL, LUCA_API_KEY   optional: Luca's address (https) and an API key, for the send_to_luca tool
 //
 // Nothing may be printed to stdout: it carries the protocol.
@@ -23,7 +25,9 @@ if (!env.SPR_AGENT_ID || !env.SPR_ENTITY) {
 }
 const binding = (env.SPR_BINDING ?? "").toLowerCase() === "on";
 const book = new SprBook({ dir: resolve(env.SPR_DIR ?? "spr-books"), agentId: env.SPR_AGENT_ID, entity: env.SPR_ENTITY,
-  owner: env.SPR_OWNER ?? null, timeZone: env.SPR_TIME_ZONE ?? "UTC", binding });
+  owner: env.SPR_OWNER ?? null, timeZone: env.SPR_TIME_ZONE ?? "UTC", binding,
+  agentType: env.SPR_AGENT_TYPE || undefined, agentProvider: env.SPR_AGENT_PROVIDER || undefined, agentVersion: env.SPR_AGENT_VERSION || undefined,
+  entityType: env.SPR_ENTITY_TYPE || undefined, entityIdentifier: env.SPR_ENTITY_ID || undefined });
 const luca = env.LUCA_URL && env.LUCA_API_KEY ? { url: env.LUCA_URL, apiKey: env.LUCA_API_KEY } : undefined;
 await createSprMcpServer(book, { binding, luca, exportDir: env.SPR_EXPORT_DIR ? resolve(env.SPR_EXPORT_DIR) : undefined }).connect(new StdioServerTransport());
 console.error(`SPR MCP server on stdio: sealing in ${book.dir} with key ${book.keyId}`);

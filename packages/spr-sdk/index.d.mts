@@ -8,11 +8,14 @@ export interface BookConfig {
   dir: string; agentId: string; entity: string; owner?: string | null; timeZone?: string;
   binding?: boolean; key?: KeyObject | string; now?: () => Date;
   /** Allow a book in a folder that syncs to the cloud (OneDrive, Dropbox, iCloud, Google Drive). Refused by default. */ allowSyncedFolder?: boolean; producer?: { name: string; version: string };
+  /** Machine Payment Profile (RFC 0001): sealed only when set. entityIdentifier is "scheme:value", such as "lei:5493001KJTIIGC8Y1R12". */
+  agentType?: string; agentProvider?: string; agentVersion?: string; entityType?: "organization" | "person" | string; entityIdentifier?: string | { scheme?: string; value: string };
 }
 export interface Check { check: string; ok: boolean; detail: string; severity?: "hard" | "note" }
 export interface IntentInput {
   purpose: string; counterparty?: string; expected_amount_minor?: number; max_amount_minor?: number; currency?: string;
   rail?: string; rail_ref?: Record<string, string>; terms?: Record<string, unknown>; expires_in?: string; expires_in_hours?: number;
+  /** What is being bought: a product, plan or service reference. */ product?: string;
 }
 export interface IntentReceipt {
   intent_id: string; decision: "none" | "within_mandate" | "outside_mandate"; authority: Authority; checks: Check[]; declared_at: string; expires_at: string; max_amount_minor: number | null;
@@ -27,6 +30,9 @@ export interface SettlementInput {
   correction?: { reason: string };
   intent_id?: string; memo?: string; state?: "cleared" | "pending"; direction?: "outflow" | "inflow"; nonce?: string | null;
   x402?: { authorization?: { nonce?: string } }; evidence?: Record<string, unknown>;
+  /** Machine Payment Profile (RFC 0001), each sealed only when given. counterparty_id is "scheme:value", such as "domain:data.example". */
+  network?: string; evidence_type?: "onchain" | "provider_reference" | string; settlement_provider?: string;
+  counterparty_type?: string; counterparty_id?: string | { scheme?: string; value: string }; receipt?: { ref?: string; sha256?: string; kind?: string };
 }
 /** "conflict": different facts for a payment already sealed, given without a correction. Nothing is sealed, and
  *  differs lists what differs. */
@@ -55,6 +61,8 @@ export declare class SprBook {
   verifyRecord(recordId: string): SealCheck & { record_id: string; core_fields: CoreCheck; key_id: string; how_to_check: string };
   listRecords(opts?: { all?: boolean }): { record_id: string; rail: string; amount_minor: number; currency: string; settled_on: string; counterparty: string | null; intent_id: string | null; within_consent: boolean | null; payload_sha256: string }[];
   exportPackage(outDir: string, opts?: { overwrite?: boolean }): { folder: string; files: string[]; verified: boolean; passed: number; failed: number };
+  /** The book's payments as xBRL-CSV in the concepts of the draft Machine Payment Profile for XBRL GL. */
+  exportXbrlCsv(outDir: string, opts?: { overwrite?: boolean }): { folder: string; files: string[]; rows: number; namespace: string };
   /** The book's public key, which finance registers with Luca once. */
   publicKey(): { key_id: string; public_pem: string; entity: string; agent_id: string };
   /** The book as a package: each file by name, as text, with a sealed manifest. */

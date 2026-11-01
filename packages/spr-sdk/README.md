@@ -58,6 +58,23 @@ const tools = toLangChainTools(book, tool);
 
 The tools are `record_intent`, `check_payment`, `record_settlement`, `cancel_intent`, `get_intent` and `verify_record`, all as plain JSON Schema. `sprTools(book)` gives the same tools for any other framework.
 
+## Facts for the Machine Payment Profile
+
+A book can carry the facts the draft Machine Payment Profile for XBRL GL asks for. Each is sealed only when given (`rfcs/0001-machine-payment-profile.md` names them):
+
+```js
+const book = new SprBook({ dir: "./books", agentId: "agt_research", entity: "Example Co",
+  agentType: "autonomous-agent", agentProvider: "Example Co", agentVersion: "2.3.0",
+  entityType: "organization", entityIdentifier: "lei:5493001KJTIIGC8Y1R12" });
+book.declare({ purpose: "Market data for the weekly pricing report", product: "pro-monthly", max_amount_minor: 20000000, currency: "USDC" });
+book.seal({ rail: "x402", source_id: txHash, amount_minor: 15000000, currency: "USDC", occurred_at, intent_id,
+  network: "base", evidence_type: "onchain", settlement_provider: "facilitator.example",
+  counterparty_type: "service", counterparty_id: "domain:data.example", receipt: { ref: "s3://receipts/123.pdf", sha256 } });
+book.exportXbrlCsv("./xbrl");   // mpp-report.json and mpp-payments.csv
+```
+
+A `mandate.json` may also name its `issuer` and `scope`; each intent then carries the mandate's reference and a hash of it.
+
 ## Labels
 
 - `book.label(recordId, { counterparty, product, tax })` seals your side of the label.

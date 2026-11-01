@@ -316,3 +316,69 @@ class GroupOne(unittest.TestCase):
             self.assertTrue(book.export_package(os.path.join(d, "e"), overwrite=True)["verified"])
             with self.assertRaises(ValueError):
                 book.export_package(os.path.join(d, "book"))
+
+
+class Crashes(unittest.TestCase):
+    def test_a_torn_last_line_is_set_aside_and_the_book_opens(self):
+        with tempfile.TemporaryDirectory() as d:
+            at = "2026-10-31T12:00:00Z"
+            SprBook(dir=d, agent_id="agt_torn", entity="Example Co").seal(rail="stripe", source_id="pi_one", amount_minor=100, currency="USD", occurred_at=at)
+            with open(os.path.join(d, "records.jsonl"), "a", encoding="utf-8") as f:
+                f.write('{"payload":{"record_id":"LR-HALF')
+            book = SprBook(dir=d, agent_id="agt_torn", entity="Example Co")
+            self.assertEqual(book.seal(rail="stripe", source_id="pi_two", amount_minor=200, currency="USD", occurred_at=at)["status"], "recorded")
+            with open(os.path.join(d, "records.jsonl"), encoding="utf-8") as f:
+                self.assertEqual(len([json.loads(l) for l in f.read().strip().split("\n")]), 2)
+            with open(os.path.join(d, "records.jsonl.torn"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"payload":{"record_id":"LR-HALF\n')
+            self.assertEqual(len(SprBook(dir=d, agent_id="agt_torn", entity="Example Co").list_records()), 2)
+
+    @unittest.skipIf(os.name == "nt", "on Windows a crashed lock is taken back after 30 seconds")
+    def test_a_lock_left_by_an_ended_process_is_taken_back(self):
+        import socket
+        import subprocess
+        import sys
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            book = SprBook(dir=d, agent_id="agt_lock", entity="Example Co")
+            p = subprocess.Popen([sys.executable, "-c", ""])
+            p.wait()
+            with open(os.path.join(d, "book.lock"), "w", encoding="utf-8") as f:
+                json.dump({"pid": p.pid, "host": socket.gethostname(), "at": "2026-10-31T12:00:00Z"}, f)
+            t0 = time.monotonic()
+            self.assertEqual(book.seal(rail="stripe", source_id="pi_lock", amount_minor=100, currency="USD", occurred_at="2026-10-31T12:00:00Z")["status"], "recorded")
+            self.assertLess(time.monotonic() - t0, 5)
+
+
+class MachinePaymentProfile(unittest.TestCase):
+    def test_optional_facts_are_sealed_only_when_given(self):
+        from datetime import datetime, timezone
+        with tempfile.TemporaryDirectory() as d:
+            plain = SprBook(dir=os.path.join(d, "plain"), agent_id="agt_p", entity="Example Co")
+            pi = plain.get_intent(plain.declare(purpose="Plain", max_amount_minor=100, currency="USD")["intent_id"])
+            self.assertEqual(pi["agent"], {"id": "agt_p", "owner": None})
+            self.assertFalse(any(k in pi for k in ("principal", "mandate", "product")))
+
+            bd = os.path.join(d, "book")
+            book = SprBook(dir=bd, agent_id="agt_research", entity="Northwind Analytics", agent_type="autonomous-agent", agent_provider="Example Corporation",
+                           agent_version="2.3.0", entity_type="organization", entity_identifier="lei:5493001KJTIIGC8Y1R12")
+            with open(os.path.join(bd, "mandate.json"), "w", encoding="utf-8") as f:
+                json.dump({"mandate_id": "mandate-2026-00418", "issuer": "Northwind Analytics", "scope": "data-acquisition", "currency": "USDC", "max_per_payment_minor": 50000000}, f)
+            i = book.declare(purpose="Market data for the weekly pricing report", product="pro-monthly", max_amount_minor=30000000, currency="USDC")
+            ip = book.get_intent(i["intent_id"])
+            self.assertEqual(ip["agent"], {"id": "agt_research", "owner": None, "type": "autonomous-agent", "provider": "Example Corporation", "version": "2.3.0"})
+            self.assertEqual(ip["principal"], {"type": "organization", "identifier": {"scheme": "lei", "value": "5493001KJTIIGC8Y1R12"}})
+            self.assertEqual(ip["mandate"]["issuer"], "Northwind Analytics")
+            self.assertEqual(len(ip["mandate"]["sha256"]), 64)
+            self.assertEqual(ip["product"], "pro-monthly")
+            tx, sha = "0x" + "AB" * 32, "c" * 64
+            at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            r = book.seal(rail="x402", source_id=tx, amount_minor=24000000, currency="USDC", occurred_at=at, intent_id=i["intent_id"],
+                          network="base", evidence_type="onchain", settlement_provider="facilitator.example", counterparty_type="service",
+                          counterparty_id="domain:veridian.example", receipt={"ref": "receipts/123.pdf", "sha256": sha})
+            self.assertEqual(r["status"], "recorded")
+            rec = book.records[-1]["payload"]
+            self.assertEqual(rec["evidence"], {"kind": "onchain", "network": "base", "provider": "facilitator.example", "chain": "base", "tx_hash": tx.lower()})
+            self.assertEqual(rec["counterparty_ref"], {"type": "service", "identifier": {"scheme": "domain", "value": "veridian.example"}})
+            self.assertEqual(rec["receipt"], {"ref": "receipts/123.pdf", "sha256": sha, "kind": None})
+            self.assertTrue(book.verify_record(r["record_id"])["ok"])

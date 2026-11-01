@@ -2,6 +2,14 @@
 
 Versions apply to all four packages together: `@luca-network/spr`, `@luca-network/spr-sdk`, `@luca-network/spr-mcp` and `spr-sdk` for Python. The format is draft 1 throughout (`spr/draft-1`); a book written by any of these versions opens in any other.
 
+## 0.1.7 (31 October 2026)
+
+No change to what a record must hold. Upgrading is optional; books written before open and check as they did.
+
+- **Facts for the Machine Payment Profile.** Intents and records can carry the agent's type, provider and version; the principal's type and identifier (such as an LEI); the mandate's issuer, scope, validity and hash; what is being bought; the settlement's network, evidence kind and provider (such as an x402 facilitator); how the counterparty was identified; and a reference to a receipt with its hash. Each is sealed only when given. In JavaScript and Python, and as parameters of the MCP tools. The names are proposed in `rfcs/0001-machine-payment-profile.md`, open for comment until 30 November 2026.
+- **xBRL-CSV.** `book.exportXbrlCsv(folder)` and the MCP tool `export_xbrl_csv` write the book's payments as xBRL-CSV in the concepts of the draft Machine Payment Profile for XBRL GL. JavaScript only for now.
+- **Terms.** The RFC defines machine payment, AI agent payment, autonomous agent payment, machine-to-machine payment and subledger, as SPR uses them.
+
 ## 0.1.6 (31 October 2026)
 
 No change to the format or to what a record holds. Upgrade: this release fixes a way a crash could stop a book opening.

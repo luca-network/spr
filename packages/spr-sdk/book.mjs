@@ -23,7 +23,7 @@ import { execFileSync } from "node:child_process";
 import { createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import * as L from "@luca-network/spr";
 
-export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.6" };
+export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.7" };
 const RECORD_SCHEMA = "luca.record/0.7";   // SPR section 6; the hosted service seals the same schema
 const INTENT_SCHEMA = "luca.intent/0.1";
 const CLOCK_SKEW_MS = 2 * 60_000;
@@ -69,6 +69,119 @@ function setAsideTornTail(file) {
     appendFileSync(file + ".torn", Buffer.concat([buf.subarray(end), Buffer.from("\n")]));
     ftruncateSync(fd, end);
   } finally { closeSync(fd); }
+}
+// ---- the Machine Payment Profile (draft 0.2, SPR RFC 0001) ----
+// Optional facts about the agent, the principal, the mandate, the counterparty and the settlement, named after the
+// Machine Payment Profile for XBRL GL. Each appears in a sealed payload only when it is given, so books that use
+// none of them seal exactly what they sealed before.
+function identifierOf(v) {
+  if (v == null || v === "") return null;
+  if (typeof v === "object") return v.value ? { scheme: v.scheme ? String(v.scheme) : null, value: String(v.value) } : null;
+  const s = String(v), i = s.indexOf(":");
+  return i > 0 ? { scheme: s.slice(0, i), value: s.slice(i + 1) } : { scheme: null, value: s };
+}
+function mandateRefOf(m) {
+  let sha256 = null;
+  try { sha256 = L.sha256Hex(L.canonicalize(m)); } catch {}
+  return { id: m.mandate_id ?? null, issuer: m.issuer ?? null, scope: m.scope ?? null, valid_from: m.valid_from ?? null, valid_until: m.valid_until ?? null, sha256 };
+}
+// The settlement evidence: the evidence given whole, or built from the settlement's network, kind and provider.
+function evidenceOf(input) {
+  const kind = input.evidence_type ?? null, network = input.network ?? null, provider = input.settlement_provider ?? null;
+  if (!kind && !network && !provider) return input.evidence ?? null;
+  const built = { kind: kind ?? "provider_reference", network, provider,
+    ...(kind === "onchain" ? { chain: network, tx_hash: /^0x[0-9a-f]+$/i.test(input.source_id) ? input.source_id.toLowerCase() : input.source_id } : { reference: input.source_id }) };
+  return { ...built, ...(input.evidence ?? {}) };
+}
+function profileFactsOf(input) {
+  const out = {}, id = identifierOf(input.counterparty_id);
+  if (input.counterparty_type || id) out.counterparty_ref = { type: input.counterparty_type ?? null, identifier: id };
+  if (input.receipt?.ref || input.receipt?.sha256) {
+    if (input.receipt.sha256 && !/^[0-9a-f]{64}$/i.test(input.receipt.sha256)) throw new Error("receipt.sha256 is the receipt's SHA-256 in hexadecimal (64 characters)");
+    out.receipt = { ref: input.receipt.ref ?? null, sha256: input.receipt.sha256?.toLowerCase() ?? null, kind: input.receipt.kind ?? null };
+  }
+  return out;
+}
+
+// The book's payments as xBRL-CSV in the concepts of the draft profile: one row per payment, the current version of
+// each record, with the intent it was paid under. There is no published taxonomy yet, so the report names none; the
+// concept names, units and dimensions are the draft's, for review with the XBRL GL community.
+export const MPP_NAMESPACE = "https://github.com/luca-network/spr/xbrl/mpp/draft-0.2";
+const TOKEN_DECIMALS = { USDC: 6, USDT: 6, EURC: 6, PYUSD: 6, USDG: 6 };
+function decimalsOf(currency) {
+  if (TOKEN_DECIMALS[currency] !== undefined) return TOKEN_DECIMALS[currency];
+  try { return new Intl.NumberFormat("en", { style: "currency", currency }).resolvedOptions().maximumFractionDigits; } catch { return null; }
+}
+function decimalAmount(minor, d) {
+  if (d === null || !Number.isSafeInteger(minor)) return "";
+  const neg = minor < 0, s = String(Math.abs(minor)).padStart(d + 1, "0");
+  return (neg ? "-" : "") + (d ? `${s.slice(0, -d)}.${s.slice(-d)}` : s);
+}
+const isIso4217 = (c) => /^[A-Z]{3}$/.test(c) && TOKEN_DECIMALS[c] === undefined && decimalsOf(c) !== null;
+// [column, concept (null for a column that only feeds a dimension), kind]
+const MPP_COLUMNS = [
+  ["transactionId", null, "key"], ["periodInstant", null, "param"], ["principalEntity", null, "param"], ["paymentUnit", null, "param"], ["paymentDecimals", null, "param"],
+  ["recordVersion", "RecordVersion", "integer"], ["recordHash", "RecordHash", "string"], ["sealKeyIdentifier", "SealKeyIdentifier", "string"], ["assuranceSource", "AssuranceSource", "string"],
+  ["agentIdentifier", "AgentIdentifier", "string"], ["agentType", "AgentType", "string"], ["agentProvider", "AgentProvider", "string"], ["agentVersion", "AgentVersion", "string"], ["agentOwner", "AgentOwner", "string"],
+  ["principalIdentifier", "PrincipalIdentifier", "string"], ["principalIdentifierScheme", "PrincipalIdentifierScheme", "string"], ["principalName", "PrincipalName", "string"], ["principalType", "PrincipalType", "string"],
+  ["mandateReference", "MandateReference", "string"], ["mandateIssuer", "MandateIssuer", "string"], ["mandateScope", "MandateScope", "string"],
+  ["mandateValidityStart", "MandateValidityStart", "dateTime"], ["mandateValidityEnd", "MandateValidityEnd", "dateTime"], ["mandateReferenceHash", "MandateReferenceHash", "string"], ["mandateAuthority", "MandateAuthority", "string"],
+  ["intentReference", "IntentReference", "string"], ["intentHash", "IntentHash", "string"], ["intentDeclaredAt", "IntentDeclaredAt", "dateTime"], ["intentExpiresAt", "IntentExpiresAt", "dateTime"],
+  ["intentMaximumAmount", "IntentMaximumAmount", "monetary"], ["withinIntent", "WithinIntent", "boolean"], ["intentBindingStatus", "IntentBindingStatus", "string"],
+  ["transactionPurpose", "TransactionPurpose", "string"], ["productOrServiceReference", "ProductOrServiceReference", "string"], ["transactionDescription", "TransactionDescription", "string"],
+  ["counterpartyIdentifier", "CounterpartyIdentifier", "string"], ["counterpartyResolutionMethod", "CounterpartyResolutionMethod", "string"], ["counterpartyType", "CounterpartyType", "string"],
+  ["paymentRail", "PaymentRail", "string"], ["paymentNetwork", "PaymentNetwork", "string"], ["paymentAsset", "PaymentAsset", "string"], ["paymentDirection", "PaymentDirection", "string"], ["paymentState", "PaymentState", "string"],
+  ["paymentAmount", "PaymentAmount", "monetary"], ["paymentAmountMinor", "PaymentAmountMinorUnits", "integer"], ["paymentIdentifier", "PaymentIdentifier", "string"], ["paymentTimestamp", "PaymentTimestamp", "dateTime"],
+  ["settlementReference", "SettlementReference", "string"], ["settlementEvidenceType", "SettlementEvidenceType", "string"], ["settlementEvidenceValue", "SettlementEvidenceValue", "string"], ["settlementProvider", "SettlementProvider", "string"],
+  ["accountingDate", "AccountingDate", "date"], ["accountingTimeZone", "AccountingTimeZone", "string"], ["generalLedgerAccount", "GeneralLedgerAccount", "string"], ["accountingClassification", "AccountingClassification", "string"],
+  ["receiptReference", "ReceiptReference", "string"], ["receiptHash", "ReceiptHash", "string"],
+];
+function mppRow(row, intent, book) {
+  const p = row.payload, ip = intent?.payload ?? null, ev = p.evidence ?? {}, d = decimalsOf(p.currency);
+  const principal = p.principal ?? null, pid = principal?.identifier ?? null, cp = p.counterparty_ref ?? null, m = ip?.mandate ?? null;
+  const slug = (s) => String(s).normalize("NFKD").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "entity";
+  const utc = (t) => t ? new Date(t).toISOString().replace(/\.\d{3}Z$/, "") : "";
+  return {
+    transactionId: p.record_id, periodInstant: utc(p.occurred_at),
+    principalEntity: pid?.scheme === "lei" ? `lei:${pid.value}` : `spr:${slug(pid?.value ?? p.entity)}`,
+    paymentUnit: isIso4217(p.currency) ? `iso4217:${p.currency}` : `mpp:${p.currency}`, paymentDecimals: d ?? "",
+    recordVersion: p.version, recordHash: row.seal.payload_sha256, sealKeyIdentifier: row.seal.key_id, assuranceSource: p.reported_by ?? "",
+    agentIdentifier: p.agent?.id ?? "", agentType: p.agent?.type ?? "", agentProvider: p.agent?.provider ?? "", agentVersion: p.agent?.version ?? "", agentOwner: p.agent?.owner ?? "",
+    principalIdentifier: pid?.value ?? p.entity, principalIdentifierScheme: pid?.scheme ?? "", principalName: p.entity, principalType: principal?.type ?? "",
+    mandateReference: m?.id ?? ip?.mandate_id ?? "", mandateIssuer: m?.issuer ?? "", mandateScope: m?.scope ?? "", mandateValidityStart: m?.valid_from ?? "", mandateValidityEnd: m?.valid_until ?? "",
+    mandateReferenceHash: m?.sha256 ?? "", mandateAuthority: ip?.precheck?.authority ?? "",
+    intentReference: ip?.intent_id ?? p.intent?.intent_id ?? "", intentHash: p.intent?.payload_sha256 ?? "", intentDeclaredAt: ip?.declared_at ?? "", intentExpiresAt: ip?.expires_at ?? "",
+    intentMaximumAmount: ip?.max_amount_minor != null && ip.currency === p.currency ? decimalAmount(ip.max_amount_minor, d) : "",
+    withinIntent: p.consent ? String(p.consent.within_consent === true) : "", intentBindingStatus: p.consent?.binding?.status ?? "",
+    transactionPurpose: ip?.purpose ?? "", productOrServiceReference: ip?.product ?? "", transactionDescription: p.memo ?? "",
+    counterpartyIdentifier: cp?.identifier?.value ?? p.counterparty ?? "", counterpartyResolutionMethod: cp?.identifier?.scheme ?? (p.counterparty ? "name" : ""), counterpartyType: cp?.type ?? "",
+    paymentRail: p.rail, paymentNetwork: ev.network ?? ev.chain ?? "", paymentAsset: p.currency, paymentDirection: p.direction ?? "", paymentState: p.state ?? "",
+    paymentAmount: decimalAmount(p.amount_minor, d), paymentAmountMinor: p.amount_minor, paymentIdentifier: p.source?.id ?? "", paymentTimestamp: p.occurred_at ?? "",
+    settlementReference: p.source?.id ?? "", settlementEvidenceType: ev.kind ?? "", settlementEvidenceValue: ev.tx_hash ?? ev.reference ?? p.source?.id ?? "", settlementProvider: ev.provider ?? "",
+    accountingDate: p.settled_on ?? "", accountingTimeZone: p.time_zone ?? book.cfg.timeZone,
+    generalLedgerAccount: p.classification?.account?.code ?? p.gl_account ?? "", accountingClassification: p.classification?.nature?.code ?? "",
+    receiptReference: p.receipt?.ref ?? "", receiptHash: p.receipt?.sha256 ?? "",
+  };
+}
+function csvCell(v) {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+function mppMetadata(csvName) {
+  const columns = {};
+  for (const [name, concept, kind] of MPP_COLUMNS) {
+    if (!concept) { columns[name] = {}; continue; }
+    columns[name] = { dimensions: { concept: `mpp:${concept}`, ...(kind === "monetary" ? { unit: "$paymentUnit" } : {}) }, ...(kind === "monetary" ? { decimals: "$paymentDecimals" } : {}) };
+  }
+  return {
+    documentInfo: {
+      documentType: "https://xbrl.org/2021/xbrl-csv",
+      namespaces: { mpp: MPP_NAMESPACE, iso4217: "http://www.xbrl.org/2003/iso4217", lei: "http://standards.iso.org/iso/17442", spr: "https://github.com/luca-network/spr/entity" },
+      taxonomy: [],
+    },
+    tableTemplates: { payments: { dimensions: { entity: "$principalEntity", period: "$periodInstant", "mpp:TransactionAxis": "$transactionId" }, columns } },
+    tables: { payments: { template: "payments", url: csvName } },
+  };
 }
 // book.lock taken on this computer by a process that is no longer running.
 function lockOwnerGone(lock) {
@@ -215,6 +328,30 @@ export class SprBook {
     try { writeSync(fd, JSON.stringify(row) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
     this.refresh();
   }
+  // The agent and the principal as sealed in intents and records: the optional profile facts only when set.
+  agentInfo() {
+    const c = this.cfg;
+    return { id: c.agentId, owner: c.owner, ...(c.agentType ? { type: c.agentType } : {}), ...(c.agentProvider ? { provider: c.agentProvider } : {}), ...(c.agentVersion ? { version: c.agentVersion } : {}) };
+  }
+  principalInfo() {
+    const id = identifierOf(this.cfg.entityIdentifier);
+    return this.cfg.entityType || id ? { principal: { type: this.cfg.entityType ?? null, identifier: id } } : {};
+  }
+  // xBRL-CSV of the book's payments (the draft Machine Payment Profile): a metadata file and a CSV, in a folder of
+  // their own outside the book's folder.
+  exportXbrlCsv(outDir, opts = {}) {
+    const out = resolve(outDir);
+    if (out === resolve(this.dir)) throw new Error("Export to a folder of its own, outside the book's folder, which holds the private key");
+    const csvName = "mpp-payments.csv", metaName = "mpp-report.json";
+    if (!opts.overwrite && (existsSync(join(out, csvName)) || existsSync(join(out, metaName))))
+      throw new Error(`${outDir} already holds an xBRL-CSV export; choose another folder, or pass overwrite: true to replace it`);
+    const rows = this.locked(() => this.current().map((r) => mppRow(r, r.payload.intent?.intent_id ? this.intents.get(r.payload.intent.intent_id) : null, this)));
+    mkdirSync(out, { recursive: true });
+    const names = MPP_COLUMNS.map(([n]) => n);
+    writeFileSync(join(out, csvName), [names.join(","), ...rows.map((r) => names.map((n) => csvCell(r[n])).join(","))].join("\r\n") + "\r\n");
+    writeFileSync(join(out, metaName), JSON.stringify(mppMetadata(csvName), null, 2) + "\n");
+    return { folder: outDir, files: [metaName, csvName], rows: rows.length, namespace: MPP_NAMESPACE };
+  }
   sealRow(payload) { return { payload, seal: L.sealWith(payload, this.key) }; }
   mandate() {
     const f = join(this.dir, "mandate.json");
@@ -250,10 +387,11 @@ export class SprBook {
     const pre = this.mandateChecks(cap ?? input.expected_amount_minor ?? null, currency, now);
     const payload = {
       schema: INTENT_SCHEMA, intent_id: `int_${hex(10)}`,
-      agent: { id: this.cfg.agentId, owner: this.cfg.owner }, entity: this.cfg.entity, mandate_id: pre.mandate_id ?? null,
+      agent: this.agentInfo(), entity: this.cfg.entity, ...this.principalInfo(), mandate_id: pre.mandate_id ?? null,
+      ...(this.mandate() ? { mandate: mandateRefOf(this.mandate()) } : {}),
       purpose: input.purpose.trim(), counterparty: input.counterparty ?? null,
       expected_amount_minor: input.expected_amount_minor ?? null, max_amount_minor: cap, currency,
-      rail: input.rail ?? null, rail_ref: input.rail_ref ?? null, terms: input.terms ?? null,
+      rail: input.rail ?? null, rail_ref: input.rail_ref ?? null, terms: input.terms ?? null, ...(input.product ? { product: String(input.product) } : {}),
       declared_at: iso(now), expires_at: iso(new Date(now.getTime() + ttl)),
       precheck: { decision: pre.decision, authority: pre.authority, checks: pre.checks }, producer: this.cfg.producer,
     };
@@ -401,9 +539,9 @@ export class SprBook {
       ...(timeNote ? { occurred_at_source: timeNote } : {}),
       ...(correction ? { correction } : {}),
       time_zone: this.cfg.timeZone, settled_on: this.localDate(at),
-      agent: { id: this.cfg.agentId, owner: this.cfg.owner },
+      agent: this.agentInfo(),
       rail_authorization: nonce ? [{ scheme: `${input.rail}_payment`, reference: nonce }] : [],
-      consent, evidence: input.evidence ?? null, producer: this.cfg.producer,
+      consent, evidence: evidenceOf(input), ...this.principalInfo(), ...profileFactsOf(input), producer: this.cfg.producer,
     };
     const problems = L.checkRecord(payload).problems;
     if (problems.length) throw new Error(`The record would not meet SPR: ${problems.join("; ")}`);

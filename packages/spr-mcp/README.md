@@ -50,6 +50,7 @@ Node.js 20 or later. The packages are ES modules: load them with `import`, not `
 | `verify_record` | Check a record's seal |
 | `list_records` | The book's current records |
 | `export_package` | A copy of the book with a sealed manifest, into a named folder under the export folder, for an auditor or a counterparty |
+| `export_xbrl_csv` | The book's payments as xBRL-CSV, in the concepts of the draft Machine Payment Profile for XBRL GL, into a named folder under the export folder |
 | `send_to_luca` | Send the book to Luca's hosted service (only when `LUCA_URL` and `LUCA_API_KEY` are set) |
 
 Check an export with `npx spr-verify <folder>`, with no Luca code.
@@ -65,6 +66,8 @@ Check an export with `npx spr-verify <folder>`, with no Luca code.
 | `SPR_TIME_ZONE` | The company's time zone, for accounting dates (default UTC) |
 | `SPR_BINDING` | `on` to return the nonce to sign with each intent |
 | `SPR_EXPORT_DIR` | The folder exports go under (default: `exports` inside the book's folder). The `export_package` tool takes a folder name, never a path |
+| `SPR_AGENT_TYPE`, `SPR_AGENT_PROVIDER`, `SPR_AGENT_VERSION` | Optional: the kind of agent, who built it, and its version, sealed with each intent and record |
+| `SPR_ENTITY_TYPE`, `SPR_ENTITY_ID` | Optional: `organization` or `person`, and the company's identifier as `scheme:value`, such as `lei:5493001KJTIIGC8Y1R12` |
 | `LUCA_URL`, `LUCA_API_KEY` | Optional: Luca's address and an API key, which add the `send_to_luca` tool |
 
 The folder holds the company's private key (`key.pem`). Keep it out of source control. Another process can use the same folder at the same time, such as a script or a second MCP client; each write takes `book.lock` for a moment, so nothing is lost.

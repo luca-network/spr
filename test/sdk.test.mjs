@@ -457,3 +457,69 @@ test("export_package refuses an export folder that is a link", async () => {
     assert.equal(exp.run({ name: "audit-2" }).verified, true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("Machine Payment Profile: the optional facts are sealed only when given, and the book exports as xBRL-CSV", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "spr-mpp-"));
+  try {
+    // A book that gives none of them seals what it sealed before.
+    const plain = new SprBook({ dir: join(dir, "plain"), agentId: "agt_p", entity: "Example Co" });
+    const pi = plain.getIntent(plain.declare({ purpose: "Plain", max_amount_minor: 100, currency: "USD" }).intent_id);
+    assert.deepEqual(pi.agent, { id: "agt_p", owner: null });
+    assert.equal("principal" in pi || "mandate" in pi || "product" in pi, false);
+
+    const bookDir = join(dir, "book");
+    const b = new SprBook({ dir: bookDir, agentId: "agt_research", entity: "Northwind Analytics", agentType: "autonomous-agent", agentProvider: "Example Corporation",
+      agentVersion: "2.3.0", entityType: "organization", entityIdentifier: "lei:5493001KJTIIGC8Y1R12" });
+    writeFileSync(join(bookDir, "mandate.json"), JSON.stringify({ mandate_id: "mandate-2026-00418", issuer: "Northwind Analytics", scope: "data-acquisition", currency: "USDC", max_per_payment_minor: 50000000 }));
+    const i = b.declare({ purpose: "Market data for the weekly pricing report", product: "pro-monthly", counterparty: "Veridian Data", max_amount_minor: 30000000, currency: "USDC" });
+    const ip = b.getIntent(i.intent_id);
+    assert.deepEqual(ip.agent, { id: "agt_research", owner: null, type: "autonomous-agent", provider: "Example Corporation", version: "2.3.0" });
+    assert.deepEqual(ip.principal, { type: "organization", identifier: { scheme: "lei", value: "5493001KJTIIGC8Y1R12" } });
+    assert.equal(ip.mandate.id, "mandate-2026-00418"); assert.equal(ip.mandate.issuer, "Northwind Analytics"); assert.match(ip.mandate.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(ip.product, "pro-monthly");
+
+    const tx = "0x" + "ab".repeat(32), sha = "c".repeat(64), at = new Date().toISOString();
+    const r = b.seal({ rail: "x402", source_id: tx, amount_minor: 24000000, currency: "USDC", occurred_at: at, intent_id: i.intent_id, counterparty: "Veridian Data", memo: "Market data API calls",
+      network: "base", evidence_type: "onchain", settlement_provider: "facilitator.example", counterparty_type: "service", counterparty_id: "domain:veridian.example", receipt: { ref: "receipts/123.pdf", sha256: sha } });
+    assert.equal(r.status, "recorded");
+    const rec = b.records.at(-1).payload;
+    assert.deepEqual(rec.evidence, { kind: "onchain", network: "base", provider: "facilitator.example", chain: "base", tx_hash: tx });
+    assert.deepEqual(rec.counterparty_ref, { type: "service", identifier: { scheme: "domain", value: "veridian.example" } });
+    assert.deepEqual(rec.receipt, { ref: "receipts/123.pdf", sha256: sha, kind: null });
+    assert.equal(rec.principal.identifier.value, "5493001KJTIIGC8Y1R12");
+    assert.equal(b.verifyRecord(r.record_id).ok, true);
+    assert.throws(() => b.seal({ rail: "x402", source_id: "0x" + "cd".repeat(32), amount_minor: 1, currency: "USDC", occurred_at: at, receipt: { ref: "r", sha256: "nothex" } }), /SHA-256/);
+
+    const out = b.exportXbrlCsv(join(dir, "xbrl"));
+    assert.equal(out.rows, 1);
+    const meta = JSON.parse(readFileSync(join(dir, "xbrl", "mpp-report.json"), "utf8"));
+    assert.equal(meta.documentInfo.documentType, "https://xbrl.org/2021/xbrl-csv");
+    const [head, row] = readFileSync(join(dir, "xbrl", "mpp-payments.csv"), "utf8").trim().split("\r\n");
+    const cols = head.split(","), cells = row.split(",");
+    const v = Object.fromEntries(cols.map((c, k) => [c, cells[k]]));
+    assert.equal(v.paymentAmount, "24.000000"); assert.equal(v.paymentAmountMinor, "24000000"); assert.equal(v.paymentUnit, "mpp:USDC");
+    assert.equal(v.principalEntity, "lei:5493001KJTIIGC8Y1R12"); assert.equal(v.mandateReference, "mandate-2026-00418"); assert.equal(v.mandateAuthority, "self-declared");
+    assert.equal(v.transactionPurpose, "Market data for the weekly pricing report"); assert.equal(v.productOrServiceReference, "pro-monthly");
+    assert.equal(v.intentMaximumAmount, "30.000000"); assert.equal(v.withinIntent, "true"); assert.equal(v.settlementEvidenceValue, tx); assert.equal(v.paymentNetwork, "base");
+    assert.equal(v.assuranceSource, "agent"); assert.equal(v.recordHash, b.records.at(-1).seal.payload_sha256);
+    for (const c of cols) assert.ok(c in meta.tableTemplates.payments.columns, c);
+    assert.throws(() => b.exportXbrlCsv(join(dir, "xbrl")), /already holds/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("export_xbrl_csv: the MCP tool writes under the export folder and takes a name, never a path", async () => {
+  const { mcpTools } = await import("@luca-network/spr-mcp");
+  const dir = mkdtempSync(join(tmpdir(), "spr-mpp-mcp-"));
+  try {
+    const book = new SprBook({ dir: join(dir, "book"), agentId: "agt_x", entity: "Example Co" });
+    book.seal({ rail: "stripe", source_id: "pi_1", amount_minor: 1999, currency: "USD", occurred_at: "2026-10-31T12:00:00Z", counterparty: "Example, Inc." });
+    const exp = mcpTools(book, { exportDir: join(dir, "exports") }).find((t) => t.name === "export_xbrl_csv");
+    assert.throws(() => exp.run({ name: "../out" }), /plain folder name/);
+    assert.equal(exp.run({ name: "xbrl-2026-10" }).rows, 1);
+    const csv = readFileSync(join(dir, "exports", "xbrl-2026-10", "mpp-payments.csv"), "utf8");
+    assert.match(csv, /"Example, Inc\."/);
+    assert.match(csv, /,19\.99,1999,/);
+    assert.match(csv, /iso4217:USD/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

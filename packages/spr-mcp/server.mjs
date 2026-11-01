@@ -18,22 +18,28 @@ const EXPORT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export function exportRoot(book, opts = {}) { return resolve(opts.exportDir ?? join(book.dir, "exports")); }
 export function mcpTools(book, opts = {}) {
   const root = exportRoot(book, opts);
+  // An export goes into a plain folder name under the root: never a path, and never a link.
+  const exportFolder = (given) => {
+    const name = String(given ?? "");
+    if (!EXPORT_NAME.test(name) || name.includes("..")) throw new Error(`Give a plain folder name (letters, digits, dot, dash, underscore), not a path; exports go under ${root}`);
+    const out = join(root, name);
+    if (!resolve(out).startsWith(root + sep)) throw new Error(`Exports go under ${root}`);
+    let link = false; try { link = lstatSync(out).isSymbolicLink(); } catch {}
+    if (link) throw new Error(`${out} is a link; exports go only into real folders under ${root}`);
+    return out;
+  };
   return [
     ...sprTools(book),
     { name: "list_records", description: "The current version of each payment in your company's book (all versions with all: true).",
       parameters: obj({ all: { type: "boolean" } }), run: (a) => book.listRecords({ all: a?.all }), readOnly: true },
+    { name: "export_xbrl_csv", description: `Write the book's payments as xBRL-CSV, one row per payment, in the concepts of the draft Machine Payment Profile for XBRL GL, into a new folder under ${root}. Give a short folder name, not a path.`,
+      parameters: obj({ name: { type: "string", description: "A folder name: letters, digits, dot, dash or underscore, such as xbrl-2026-10" },
+        overwrite: { type: "boolean", description: "Replace an earlier export of that name" } }, ["name"]),
+      run: (a) => book.exportXbrlCsv(exportFolder(a?.name), { overwrite: a?.overwrite === true }) },
     { name: "export_package", description: `Copy the book, with a sealed manifest, into a new folder under ${root}, for an auditor or a counterparty. Give a short folder name, not a path. Anyone checks it with spr-verify.`,
       parameters: obj({ name: { type: "string", description: "A folder name: letters, digits, dot, dash or underscore, such as audit-2026-10" },
         overwrite: { type: "boolean", description: "Replace an earlier export of that name" } }, ["name"]),
-      run: (a) => {
-        const name = String(a?.name ?? "");
-        if (!EXPORT_NAME.test(name) || name.includes("..")) throw new Error(`Give a plain folder name (letters, digits, dot, dash, underscore), not a path; exports go under ${root}`);
-        const out = join(root, name);
-        if (!resolve(out).startsWith(root + sep)) throw new Error(`Exports go under ${root}`);
-        let link = false; try { link = lstatSync(out).isSymbolicLink(); } catch {}
-        if (link) throw new Error(`${out} is a link; exports go only into real folders under ${root}`);
-        return book.exportPackage(out, { overwrite: a?.overwrite === true });
-      } },
+      run: (a) => book.exportPackage(exportFolder(a?.name), { overwrite: a?.overwrite === true }) },
     ...(opts.luca ? [{ name: "send_to_luca", description: "Send the book to Luca, which checks every seal, then classifies each payment and posts it to the company's books. Sending it again changes nothing.",
       parameters: obj({}), run: () => book.sendToLuca(opts.luca), openWorld: true }] : []),
   ];

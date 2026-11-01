@@ -27,7 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from . import format as L
 
-SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.6"}
+SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.7"}
 RECORD_SCHEMA = "luca.record/0.7"
 INTENT_SCHEMA = "luca.intent/0.1"
 CLOCK_SKEW = timedelta(minutes=2)
@@ -135,6 +135,53 @@ def _lock_owner_gone(lock) -> bool:
     return False
 
 
+# ---- the Machine Payment Profile (draft 0.2, SPR RFC 0001) ----
+# Optional facts about the agent, the principal, the mandate, the counterparty and the settlement, named after the
+# Machine Payment Profile for XBRL GL. Each appears in a sealed payload only when it is given, so books that use
+# none of them seal exactly what they sealed before.
+def _identifier_of(v):
+    if v is None or v == "":
+        return None
+    if isinstance(v, dict):
+        return {"scheme": str(v["scheme"]) if v.get("scheme") else None, "value": str(v["value"])} if v.get("value") else None
+    s = str(v)
+    i = s.find(":")
+    return {"scheme": s[:i], "value": s[i + 1:]} if i > 0 else {"scheme": None, "value": s}
+
+
+def _mandate_ref_of(m):
+    try:
+        sha = L.sha256_hex(L.canonicalize(m))
+    except Exception:
+        sha = None
+    return {"id": m.get("mandate_id"), "issuer": m.get("issuer"), "scope": m.get("scope"), "valid_from": m.get("valid_from"),
+            "valid_until": m.get("valid_until"), "sha256": sha}
+
+
+def _evidence_of(source_id, evidence, evidence_type, network, provider):
+    """The settlement evidence: the evidence given whole, or built from the settlement's network, kind and provider."""
+    if not evidence_type and not network and not provider:
+        return evidence
+    built = {"kind": evidence_type or "provider_reference", "network": network, "provider": provider}
+    if evidence_type == "onchain":
+        built.update({"chain": network, "tx_hash": source_id.lower() if re.fullmatch(r"0x[0-9a-fA-F]+", source_id) else source_id})
+    else:
+        built["reference"] = source_id
+    return {**built, **(evidence or {})}
+
+
+def _profile_facts_of(counterparty_type, counterparty_id, receipt):
+    out, ident = {}, _identifier_of(counterparty_id)
+    if counterparty_type or ident:
+        out["counterparty_ref"] = {"type": counterparty_type, "identifier": ident}
+    if receipt and (receipt.get("ref") or receipt.get("sha256")):
+        sha = receipt.get("sha256")
+        if sha and not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+            raise ValueError("receipt.sha256 is the receipt's SHA-256 in hexadecimal (64 characters)")
+        out["receipt"] = {"ref": receipt.get("ref"), "sha256": sha.lower() if sha else None, "kind": receipt.get("kind")}
+    return out
+
+
 def _line(row) -> str:
     return json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
 
@@ -192,13 +239,17 @@ def _duration(s: str) -> timedelta:
 class SprBook:
     def __init__(self, dir: str, agent_id: str, entity: str, owner: Optional[str] = None, time_zone: str = "UTC",
                  binding: bool = False, key: Optional[ed25519.Ed25519PrivateKey] = None, now=None, producer: Optional[dict] = None,
-                 allow_synced_folder: bool = False):
+                 allow_synced_folder: bool = False, agent_type: Optional[str] = None, agent_provider: Optional[str] = None,
+                 agent_version: Optional[str] = None, entity_type: Optional[str] = None, entity_identifier=None):
         if not (agent_id or "").strip() or not (entity or "").strip():
             raise ValueError("The book needs the agent's ID (agent_id) and the company it pays for (entity)")
         self.dir, self.agent_id, self.entity, self.owner = dir, agent_id, entity, owner
         self.time_zone, self.binding, self._now = time_zone, binding, now or (lambda: datetime.now(timezone.utc))
         self._zone = _zone_for(time_zone)
         self.producer = producer or SDK_PRODUCER
+        # Machine Payment Profile (RFC 0001): sealed only when set. entity_identifier is "scheme:value", such as "lei:5493…".
+        self.agent_type, self.agent_provider, self.agent_version = agent_type, agent_provider, agent_version
+        self.entity_type, self.entity_identifier = entity_type, entity_identifier
         os.makedirs(dir, exist_ok=True)
         synced = synced_folder_of(dir)
         if synced and not allow_synced_folder and os.environ.get("SPR_ALLOW_SYNCED_FOLDER") != "1":
@@ -363,6 +414,17 @@ class SprBook:
             os.fsync(f.fileno())
         self._refresh()
 
+    def _agent_info(self):
+        a = {"id": self.agent_id, "owner": self.owner}
+        for k, v in (("type", self.agent_type), ("provider", self.agent_provider), ("version", self.agent_version)):
+            if v:
+                a[k] = v
+        return a
+
+    def _principal_info(self):
+        ident = _identifier_of(self.entity_identifier)
+        return {"principal": {"type": self.entity_type, "identifier": ident}} if self.entity_type or ident else {}
+
     def _seal_row(self, payload):
         return {"payload": payload, "seal": L.seal_with(payload, self.key)}
 
@@ -395,7 +457,8 @@ class SprBook:
     @_writes
     def declare(self, purpose: str, max_amount_minor: Optional[int] = None, currency: Optional[str] = None, counterparty: Optional[str] = None,
                 expected_amount_minor: Optional[int] = None, rail: Optional[str] = None, rail_ref: Optional[dict] = None,
-                terms: Optional[dict] = None, expires_in: Optional[str] = None, expires_in_hours: Optional[int] = None) -> dict:
+                terms: Optional[dict] = None, expires_in: Optional[str] = None, expires_in_hours: Optional[int] = None,
+                product: Optional[str] = None) -> dict:
         if not (purpose or "").strip():
             raise ValueError("purpose is required: why you are paying, in one sentence")
         cap = max_amount_minor
@@ -409,9 +472,10 @@ class SprBook:
         pre = self._mandate_checks(cap if cap is not None else expected_amount_minor, cur, now)
         payload = {
             "schema": INTENT_SCHEMA, "intent_id": "int_" + secrets.token_hex(10),
-            "agent": {"id": self.agent_id, "owner": self.owner}, "entity": self.entity, "mandate_id": pre.get("mandate_id"),
+            "agent": self._agent_info(), "entity": self.entity, **self._principal_info(), "mandate_id": pre.get("mandate_id"),
+            **({"mandate": _mandate_ref_of(self._mandate())} if self._mandate() else {}),
             "purpose": purpose.strip(), "counterparty": counterparty, "expected_amount_minor": expected_amount_minor,
-            "max_amount_minor": cap, "currency": cur, "rail": rail, "rail_ref": rail_ref, "terms": terms,
+            "max_amount_minor": cap, "currency": cur, "rail": rail, "rail_ref": rail_ref, "terms": terms, **({"product": str(product)} if product else {}),
             "declared_at": _iso(now), "expires_at": _iso(now + ttl), "precheck": {"decision": pre["decision"], "authority": pre["authority"], "checks": pre["checks"]},
             "producer": self.producer,
         }
@@ -508,6 +572,8 @@ class SprBook:
     def seal(self, rail: str, source_id: str, amount_minor: int, currency: str, occurred_at: Optional[str] = None, counterparty: Optional[str] = None,
              intent_id: Optional[str] = None, memo: Optional[str] = None, state: Optional[str] = None, direction: str = "outflow",
              nonce: Optional[str] = None, evidence: Optional[dict] = None, correction: Optional[dict] = None,
+             network: Optional[str] = None, evidence_type: Optional[str] = None, settlement_provider: Optional[str] = None,
+             counterparty_type: Optional[str] = None, counterparty_id=None, receipt: Optional[dict] = None,
              ) -> dict:
         if not rail or not source_id:
             raise ValueError("rail and source_id are required")
@@ -550,6 +616,8 @@ class SprBook:
         version = earlier["payload"]["version"] + 1 if earlier else 1
         source_input = {k: v for k, v in {"rail": rail, "source_id": source_id, "amount_minor": amount_minor, "currency": currency, "occurred_at": occurred_at,
                         "counterparty": counterparty, "intent_id": intent_id, "memo": memo, "state": state, "nonce": nonce, "evidence": evidence,
+                        "network": network, "evidence_type": evidence_type, "settlement_provider": settlement_provider,
+                        "counterparty_type": counterparty_type, "counterparty_id": counterparty_id, "receipt": receipt,
                         }.items() if v is not None}
         payload = {
             "schema": RECORD_SCHEMA, "record_id": f"LR-{rail.upper()}-{L.sha256_hex(key)[:10].upper()}-v{version}",
@@ -561,9 +629,10 @@ class SprBook:
             **({"occurred_at_source": time_note} if time_note else {}),
             **({"correction": fix} if fix else {}),
             "time_zone": self.time_zone, "settled_on": self._local_date(at),
-            "agent": {"id": self.agent_id, "owner": self.owner},
+            "agent": self._agent_info(),
             "rail_authorization": [{"scheme": f"{rail}_payment", "reference": nonce}] if nonce else [],
-            "consent": consent, "evidence": evidence, "producer": self.producer,
+            "consent": consent, "evidence": _evidence_of(source_id, evidence, evidence_type, network, settlement_provider),
+            **self._principal_info(), **_profile_facts_of(counterparty_type, counterparty_id, receipt), "producer": self.producer,
         }
         problems = L.check_record(payload)["problems"]
         if problems:
