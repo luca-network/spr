@@ -2,6 +2,14 @@
 
 Versions apply to all four packages together: `@luca-network/spr`, `@luca-network/spr-sdk`, `@luca-network/spr-mcp` and `spr-sdk` for Python. The format is draft 1 throughout (`spr/draft-1`); a book written by any of these versions opens in any other.
 
+## 0.1.8 (1 November 2026)
+
+No change to the format. Upgrade if you open xBRL-CSV exports in a spreadsheet.
+
+- **Spreadsheet-safe xBRL-CSV.** A text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is now written with a leading apostrophe, so Excel and Google Sheets show it as text and never run it as a formula. Purposes, memos and counterparty names are written by agents and other parties, so they are treated as untrusted. Numbers and dates are written unchanged.
+- **AGENTS.md.** Guidance for AI coding agents working in this repository: the rules that keep records checkable, and the commands to run before a pull request.
+- **Executable commands.** `spr-verify` and `spr-mcp` are marked executable in the repository.
+
 ## 0.1.7 (31 October 2026)
 
 No change to what a record must hold. Upgrading is optional; books written before open and check as they did.

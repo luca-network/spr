@@ -523,3 +523,17 @@ test("export_xbrl_csv: the MCP tool writes under the export folder and takes a n
     assert.match(csv, /iso4217:USD/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("xBRL-CSV: text that looks like a formula is written as text, and amounts are written unchanged", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spr-csv-"));
+  try {
+    const book = new SprBook({ dir: join(dir, "book"), agentId: "agt_x", entity: "Example Co" });
+    book.seal({ rail: "stripe", source_id: "re_1", amount_minor: -500, currency: "USD", occurred_at: "2026-10-31T12:00:00Z",
+      counterparty: '=HYPERLINK("http://example.invalid","click")', memo: "@SUM(A1:A9)" });
+    book.exportXbrlCsv(join(dir, "x"));
+    const csv = readFileSync(join(dir, "x", "mpp-payments.csv"), "utf8");
+    assert.match(csv, /"'=HYPERLINK\(""http:\/\/example\.invalid"",""click""\)"/);
+    assert.match(csv, /,'@SUM\(A1:A9\),/);
+    assert.match(csv, /,-5\.00,-500,/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

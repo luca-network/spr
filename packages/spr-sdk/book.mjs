@@ -23,7 +23,7 @@ import { execFileSync } from "node:child_process";
 import { createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import * as L from "@luca-network/spr";
 
-export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.7" };
+export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.8" };
 const RECORD_SCHEMA = "luca.record/0.7";   // SPR section 6; the hosted service seals the same schema
 const INTENT_SCHEMA = "luca.intent/0.1";
 const CLOCK_SKEW_MS = 2 * 60_000;
@@ -163,8 +163,13 @@ function mppRow(row, intent, book) {
     receiptReference: p.receipt?.ref ?? "", receiptHash: p.receipt?.sha256 ?? "",
   };
 }
-function csvCell(v) {
-  const s = v === null || v === undefined ? "" : String(v);
+// Text written by agents (purpose, memo, counterparty and the like) goes into a file people open in spreadsheets. A text
+// cell that starts with = + - @, a tab or a carriage return is prefixed with an apostrophe, so a spreadsheet shows it
+// as text and never runs it as a formula (OWASP's guidance on CSV injection). Numbers and dates are written as they are.
+const FORMULA_START = /^[=+\-@\t\r]/;
+function csvCell(v, kind = "string") {
+  let s = v === null || v === undefined ? "" : String(v);
+  if (kind === "string" && FORMULA_START.test(s)) s = "'" + s;
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 function mppMetadata(csvName) {
@@ -348,7 +353,7 @@ export class SprBook {
     const rows = this.locked(() => this.current().map((r) => mppRow(r, r.payload.intent?.intent_id ? this.intents.get(r.payload.intent.intent_id) : null, this)));
     mkdirSync(out, { recursive: true });
     const names = MPP_COLUMNS.map(([n]) => n);
-    writeFileSync(join(out, csvName), [names.join(","), ...rows.map((r) => names.map((n) => csvCell(r[n])).join(","))].join("\r\n") + "\r\n");
+    writeFileSync(join(out, csvName), [names.join(","), ...rows.map((r) => names.map((n, k) => csvCell(r[n], MPP_COLUMNS[k][2])).join(","))].join("\r\n") + "\r\n");
     writeFileSync(join(out, metaName), JSON.stringify(mppMetadata(csvName), null, 2) + "\n");
     return { folder: outDir, files: [metaName, csvName], rows: rows.length, namespace: MPP_NAMESPACE };
   }
