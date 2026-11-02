@@ -2,6 +2,12 @@
 
 Versions apply to all four packages together: `@luca-network/spr`, `@luca-network/spr-sdk`, `@luca-network/spr-mcp` and `spr-sdk` for Python. The format is draft 1 throughout (`spr/draft-1`); a book written by any of these versions opens in any other.
 
+## 0.1.9 (2 November 2026)
+
+No change to the format or to how any tool behaves. Upgrading is optional.
+
+- **Clearer tool definitions.** `cancel_intent`, `list_records`, `export_xbrl_csv` and `export_package` now describe each input, what they return, what happens when an export folder already exists, and when to use one tool over another. This helps an agent pick the right tool and call it correctly.
+
 ## 0.1.8 (1 November 2026)
 
 No change to the format. Upgrade if you open xBRL-CSV exports in a spreadsheet.

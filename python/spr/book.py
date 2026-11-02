@@ -27,7 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from . import format as L
 
-SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.8"}
+SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.9"}
 RECORD_SCHEMA = "luca.record/0.7"
 INTENT_SCHEMA = "luca.intent/0.1"
 CLOCK_SKEW = timedelta(minutes=2)

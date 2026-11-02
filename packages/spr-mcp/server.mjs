@@ -30,13 +30,13 @@ export function mcpTools(book, opts = {}) {
   };
   return [
     ...sprTools(book),
-    { name: "list_records", description: "The current version of each payment in your company's book (all versions with all: true).",
-      parameters: obj({ all: { type: "boolean" } }), run: (a) => book.listRecords({ all: a?.all }), readOnly: true },
-    { name: "export_xbrl_csv", description: `Write the book's payments as xBRL-CSV, one row per payment, in the concepts of the draft Machine Payment Profile for XBRL GL, into a new folder under ${root}. Give a short folder name, not a path.`,
+    { name: "list_records", description: "Lists the payments in your company's book, one entry per payment with its current version: record_id, rail, amount_minor, currency, settled_on, counterparty, intent_id, within_consent and payload_sha256. The whole book is returned at once, with no paging. Use it to find a record_id or review what has been paid; use get_intent for one intent and verify_record to check one record's seal.",
+      parameters: obj({ all: { type: "boolean", description: "true to include every earlier version of corrected payments as well; leave out for the current version only" } }), run: (a) => book.listRecords({ all: a?.all }), readOnly: true },
+    { name: "export_xbrl_csv", description: `Writes the book's payments as xBRL-CSV for accounting and reporting systems: one row per payment, in the concepts of the draft Machine Payment Profile for XBRL GL, with the intent each was paid under. The files are mpp-report.json (the metadata) and mpp-payments.csv, in a new folder under ${root}. Give a short folder name, not a path. Returns the folder, the file names and the number of rows. If the folder already holds an export it fails, unless overwrite is true. To give an auditor or a counterparty a sealed copy they can check, use export_package instead.`,
       parameters: obj({ name: { type: "string", description: "A folder name: letters, digits, dot, dash or underscore, such as xbrl-2026-10" },
         overwrite: { type: "boolean", description: "Replace an earlier export of that name" } }, ["name"]),
       run: (a) => book.exportXbrlCsv(exportFolder(a?.name), { overwrite: a?.overwrite === true }) },
-    { name: "export_package", description: `Copy the book, with a sealed manifest, into a new folder under ${root}, for an auditor or a counterparty. Give a short folder name, not a path. Anyone checks it with spr-verify.`,
+    { name: "export_package", description: `Copies the book, with a sealed manifest, into a new folder under ${root}, for an auditor or a counterparty to check with spr-verify. Give a short folder name, not a path. Returns the folder, the files and the result of checking the copy (verified, passed, failed). If the folder already holds an export it fails, unless overwrite is true. For a spreadsheet or reporting format, use export_xbrl_csv instead.`,
       parameters: obj({ name: { type: "string", description: "A folder name: letters, digits, dot, dash or underscore, such as audit-2026-10" },
         overwrite: { type: "boolean", description: "Replace an earlier export of that name" } }, ["name"]),
       run: (a) => book.exportPackage(exportFolder(a?.name), { overwrite: a?.overwrite === true }) },

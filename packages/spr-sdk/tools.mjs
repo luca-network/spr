@@ -42,7 +42,9 @@ export function sprTools(book) {
         if (!a?.occurred_at) throw new Error("occurred_at is required: when the rail says the payment was made, with its offset, such as 2026-10-28T19:00:00Z");
         return book.seal(a);
       } },
-    { name: "cancel_intent", description: "Call this when you decide not to pay an intent you declared, or the purchase is no longer needed. Withdraws it; say why.", parameters: obj({ intent_id: str, reason: str }, ["intent_id", "reason"]),
+    { name: "cancel_intent", description: "Call this when you decide not to pay an intent you declared, or the purchase is no longer needed. Withdraws the intent so no payment can be checked or recorded against it, and seals the withdrawal with the reason. Returns the sealed withdrawal: the intent's ID, the reason and when it was withdrawn. Calling it again for the same intent returns the same withdrawal. Use get_intent first if you are not sure the intent is still open.",
+      parameters: obj({ intent_id: { type: "string", description: "The intent's ID as record_intent returned it, such as int_c8cc151ca5ca8c18960d" },
+        reason: { type: "string", description: "Why the purchase won't go ahead, in one sentence, such as 'The supplier's price rose above the cap'. An auditor reads it." } }, ["intent_id", "reason"]),
       run: (a) => book.cancelIntent(a.intent_id, a.reason) },
     { name: "get_intent", description: "Look up one of your intents to see whether it is open, matched, expired or withdrawn, such as before paying against an older intent.", parameters: obj({ intent_id: str }, ["intent_id"]),
       run: (a) => book.getIntent(a.intent_id) },
