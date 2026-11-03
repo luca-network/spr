@@ -53,6 +53,9 @@ Each member appears only when the producer has the fact. A reader that does not 
 | `evidence.provider` | settlementProvider | Who settled it, such as an x402 facilitator |
 | `counterparty_ref` | counterpartyType, counterpartyIdentifier, counterpartyResolutionMethod | `{ type, identifier: { scheme, value } }`; the scheme says how the counterparty was identified (`wallet`, `domain`, `did`, `lei` and so on). `counterparty` remains its name. |
 | `receipt` | supporting receipt or document | `{ ref, sha256, kind }`: where the receipt is kept and its hash, never the receipt itself |
+| `buyer_intent` | (proposed) buyerIntentReference, buyerIntentHash | At a merchant: the buyer's own sealed intent, its hash and the buyer's key, with the checks of the payment against it. Added in 0.2.0, during the comment period. |
+| `buyer_authentication` | (proposed) buyerAuthenticationMethod, buyerAuthenticationResult | How the buyer authenticated at checkout (`3ds`, `passkey`, `network_token`, `otp`, `agent_mandate`), its result and reference; never the evidence itself. Added in 0.2.0. |
+| `payment_refs` | orderReference, processorTransactionReference, invoiceReference | `{ order_id, processor_transaction_id, invoice_ref }`: the merchant's order ID, the payment processor's own transaction ID and the invoice paid, so the buyer's finance team, the merchant's, the processor and a card network can find the same payment. Added in 0.1.10, during the comment period. |
 
 ## 3. xBRL-CSV
 

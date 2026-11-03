@@ -1,8 +1,9 @@
-"""python -m spr <package folder> [--key <public key file or key ID>]... [--json]  |  python -m spr --vectors [<vectors.json>] [--json]
+"""python -m spr <package folder> [--key <public key file or key ID>]... [--buyer-key <public key file or key ID>]... [--json]  |  python -m spr --vectors [<vectors.json>] [--json]
 
 Without --key the result shows the package is consistent with the keys it carries: anyone can make a consistent
 package with a key of their own. With the company's public key (from the company, not from the package), every seal
-must be by that key or a key it handed over to. With --vectors and no file, the vectors packed with this package run."""
+must be by that key or a key it handed over to. With --buyer-key, every buyer's intent in a merchant's package must be
+sealed by that buyer key. With --vectors and no file, the vectors packed with this package run."""
 import json
 import os
 import re
@@ -12,13 +13,13 @@ from . import run_vectors, verify_folder
 
 args = sys.argv[1:]
 as_json = "--json" in args
-keys, rest, i = [], [], 0
+keys, buyers, rest, i = [], [], [], 0
 while i < len(args):
-    if args[i] == "--key":
+    if args[i] in ("--key", "--buyer-key"):
         if i + 1 >= len(args):
-            print("--key needs a public key file or a key ID")
+            print(f"{args[i]} needs a public key file or a key ID")
             sys.exit(2)
-        keys.append(args[i + 1])
+        (keys if args[i] == "--key" else buyers).append(args[i + 1])
         i += 2
         continue
     if not args[i].startswith("--"):
@@ -35,14 +36,16 @@ else:
     if not rest:
         print(__doc__)
         sys.exit(2)
-    expected = []
-    for k in keys:
-        if re.fullmatch(r"ed25519:[0-9a-f]{16}", k):
-            expected.append(k)
-        else:
-            with open(k, encoding="utf-8") as f:
-                expected.append(f.read())
-    out = verify_folder(rest[0], expected)
+    def load(ks):
+        got = []
+        for k in ks:
+            if re.fullmatch(r"ed25519:[0-9a-f]{16}", k):
+                got.append(k)
+            else:
+                with open(k, encoding="utf-8") as f:
+                    got.append(f.read())
+        return got
+    out = verify_folder(rest[0], load(keys), load(buyers))
 if as_json:
     print(json.dumps(out, indent=2))
 else:

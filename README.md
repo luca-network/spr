@@ -39,7 +39,9 @@ const tools = toOpenAIAgentsTools(book, tool);   // tool from "@openai/agents"; 
 
 **Any other MCP client**: run `npx -y @luca-network/spr-mcp` over stdio with the two settings above.
 
-The agent then calls `record_intent` before it pays, `check_payment` to see whether the payment is inside what it declared, and `record_settlement` after it pays. Each record is sealed in the book's folder.
+The agent then calls `record_intent` before it pays, `check_payment` to see whether the payment is inside what it declared, goes to the payee it named and wasn't paid already, and `record_settlement` after it pays. Each record is sealed in the book's folder.
+
+A merchant's book works the same way for payments received: it can keep the buyer's own sealed intent, how the buyer authenticated, and the order and processor references, and export one payment's evidence for a chargeback response (`export_dispute_pack`).
 
 A record shows:
 - what the agent declared before it paid: the purpose, the most it could spend, and when the permission expired;
@@ -95,7 +97,7 @@ The packages here run on your own machine and make no call to Luca. Luca's hoste
 |---|---|---|
 | Where it runs | Your machine, your folder, your key | Luca's service |
 | What it records | The intent before paying and the payment after, as the agent reports them | The same, plus the payment as the rail itself reports it |
-| Limits it checks | The declared intent: its cap, its expiry, and whether it was withdrawn. Optionally the book's own `mandate.json`, which whoever keeps the folder writes, so it is reported as `authority: "self-declared"` | Mandates your finance team approves in Luca |
+| Limits it checks | The declared intent: its cap, its expiry, whether it was withdrawn and the payee it named; the same invoice paid twice. Optionally the book's own `mandate.json` (limits, payees, a window for repeats), which whoever keeps the folder writes, so it is reported as `authority: "self-declared"` | Mandates your finance team approves in Luca |
 | Confirmation from the rail | None: the record is what the agent reported | The payment read from the rail, and any difference flagged |
 | Accounting | None | Classification to your accounts (US GAAP, IFRS, tax), journal entries posted to your ERP, the month's close |
 | Evidence | Seals anyone can check with `spr-verify` or `python -m spr` | Evidence your auditor can check, and the month's audit package |

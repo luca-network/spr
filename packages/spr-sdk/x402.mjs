@@ -91,7 +91,8 @@ export function withLuca(book, options) {
     if (!luca) return baseFetch(input, rest);
     const currency = (luca.currency ?? "USDC").toUpperCase();
     const intent = book.declare({ purpose: luca.purpose, counterparty: luca.counterparty, max_amount_minor: luca.max_amount_minor,
-      expected_amount_minor: luca.expected_amount_minor, currency, rail: "x402", terms: luca.terms, expires_in: luca.expires_in ?? "PT1H" });
+      expected_amount_minor: luca.expected_amount_minor, currency, rail: "x402", terms: luca.terms, expires_in: luca.expires_in ?? "PT1H",
+      ...(luca.payee_id ? { payee_id: luca.payee_id } : {}) });
     const nonce = book.nonceFor(intent.intent_id);
     // The fetch underneath is tapped so the book sees the seller's requirements and the payer's authorization.
     let required = null, signed = null;
@@ -107,15 +108,17 @@ export function withLuca(book, options) {
     // The x402 client wraps errors in its own, so a decline is kept here and rethrown as itself.
     let declined = null;
     const check = async (r) => {
+      // The payee checked is the address the seller's payment request asks to be paid, which is what gets signed.
       const c = book.checkPayment({ amount_minor: Number(r.amount), currency, counterparty: luca.counterparty ?? r.payTo,
-        intent_id: intent.intent_id, nonce: r.nonce,
+        payee_id: r.payee_id ?? (r.payTo ? `wallet:${r.payTo}` : undefined), invoice_ref: luca.invoice_ref, intent_id: intent.intent_id, nonce: r.nonce,
       });
       if (c.decision !== "approve") declined = c;
       return c;
     };
     const client = bind ? new IntentBoundExactEvmScheme(options.signer, { nonce, expiresAt: intent.expires_at, check }) : new ExactEvmScheme(options.signer);
     if (!bind) {
-      const r = await check({ amount: String(luca.expected_amount_minor ?? luca.max_amount_minor ?? 0), payTo: luca.counterparty ?? "", nonce: null });
+      // Without binding the standard client signs whatever the seller asks, so the payee checked is the one declared.
+      const r = await check({ amount: String(luca.expected_amount_minor ?? luca.max_amount_minor ?? 0), payTo: "", payee_id: luca.payee_id, nonce: null });
       if (r.decision !== "approve") { book.cancelIntent(intent.intent_id, `Declined by the pre-payment check ${r.id}`); throw new PaymentDeclinedByLuca(r.id, r.reasons); }
     }
     const paid = wrapFetchWithPaymentFromConfig(tap, { schemes: [{ network: "eip155:*", client }] });
@@ -141,7 +144,8 @@ export function withLuca(book, options) {
     const auth = signed?.payload?.authorization ?? null;
     const record = book.seal({
       rail: "x402", source_id: settled.transaction, amount_minor: Number(settled.amount ?? accepted.amount), currency,
-      occurred_at: new Date().toISOString(), counterparty: luca.counterparty ?? accepted.payTo, intent_id: intent.intent_id,
+      occurred_at: new Date().toISOString(), counterparty: luca.counterparty ?? accepted.payTo, counterparty_id: `wallet:${accepted.payTo}`,
+      ...(luca.invoice_ref ? { invoice_ref: luca.invoice_ref } : {}), intent_id: intent.intent_id,
       nonce: auth?.nonce ?? null, state: settled.success ? "cleared" : "pending",
       evidence: { network: settled.network ?? accepted.network, payer: settled.payer ?? options.signer.address, payee: accepted.payTo,
         asset: accepted.asset, resource: required?.resource?.url ?? String(input), transaction: settled.transaction },

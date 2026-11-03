@@ -258,7 +258,9 @@ export function checkKeyHandover(row, keys) {
 // ---- 9. a local package ----------------------------------------------------------------------------------
 // The only files a package holds (section 8). A manifest that names anything else is refused, so a package can
 // never send a checker outside its own folder.
-export const PACKAGE_FILES = ["manifest.json", "keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"];
+export const PACKAGE_FILES = ["manifest.json", "keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl",
+  "buyer-intents.jsonl", "dispute.json", "summary.txt"];
+export const DISPUTE_SCHEMA = "luca.dispute-pack/0.1";
 const isKeyId = (k) => typeof k === "string" && /^ed25519:[0-9a-f]{16}$/.test(k);
 
 // Problems in a set of records as a whole: one record ID with two different contents, or two records of one
@@ -369,6 +371,45 @@ export function verifyPackage(read, opts = {}) {
   const set = checkRecordSet(records.map((r) => r.payload ?? {}));
   check("no record ID holds two different records, and no payment has two records of one version", set.ok, set.problems.join("; "));
 
+  // A merchant's records may name the buyer's own sealed intent (section 8.1). Each is sealed with the buyer's key,
+  // which travels beside it, and is checked with that key alone; the buyer's keys never count as the company's.
+  const buyerByHash = new Map(), buyerSigners = new Set();
+  for (const b of jsonl("buyer-intents.jsonl")) {
+    const s = normalizeSeal(b?.intent?.seal ?? {}), k = b?.key ?? {}, id = b?.intent?.payload?.intent_id;
+    let keyOk = false;
+    try { keyOk = isKeyId(k.key_id) && keyIdFor(k.public_pem) === k.key_id && s.key_id === k.key_id; } catch {}
+    const v = keyOk ? verifySeal(b.intent.payload, s, k.public_pem, k.algorithm ?? s.algorithm) : null;
+    check(`the buyer's intent ${id} is sealed by the buyer's key ${k.key_id}`, Boolean(v?.ok),
+      !keyOk ? "the key beside it is not the key that sealed it" : v.ok ? "" : !v.hash_matches ? "the payload's hash is not the sealed hash" : "the signature does not verify with that key");
+    const c = checkIntent(b?.intent?.payload);
+    check(`the buyer's intent ${id} has the core fields`, c.ok, c.problems.join("; "));
+    if (s.key_id) buyerSigners.add(s.key_id);
+    buyerByHash.set(s.payload_sha256, b);
+  }
+  for (const r of records) {
+    const bi = r.payload?.buyer_intent;
+    if (!bi) continue;
+    const b = buyerByHash.get(bi.payload_sha256);
+    check(`record ${r.payload.record_id}: the buyer's intent it names is in the package`, Boolean(b) && b.intent.payload.intent_id === bi.intent_id && b.key.key_id === bi.key_id,
+      `${bi.intent_id} (${bi.payload_sha256})`);
+  }
+  const expectedBuyer = (opts.buyerKeys ?? []).map((k) => isKeyId(k) ? k : keyIdFor(k));
+  if (expectedBuyer.length)
+    check(`every buyer's intent is sealed by an expected buyer key ${expectedBuyer.join(" or ")}`, [...buyerSigners].every((id) => expectedBuyer.includes(id)),
+      [...buyerSigners].filter((id) => !expectedBuyer.includes(id)).join(", "));
+
+  // A dispute package: its sealed statement names records in the package, and its summary is the text it hashed.
+  const disputeBytes = get("dispute.json");
+  if (disputeBytes) {
+    const d = JSON.parse(disputeBytes.toString("utf8"));
+    const s = sealOk(d.dispute, d.seal);
+    check("dispute.json is sealed", s.ok, s.detail);
+    check("dispute.json is a dispute package statement", d.dispute?.schema === DISPUTE_SCHEMA, d.dispute?.schema);
+    for (const id of d.dispute?.records ?? []) check(`dispute.json: record ${id} is in the package`, recById.has(id));
+    const summary = get("summary.txt");
+    check("summary.txt is the summary dispute.json was sealed with", Boolean(summary) && sha256Hex(summary) === d.dispute?.summary_sha256, summary ? "its SHA-256 differs" : "missing");
+  }
+
   // Whose package it is.
   const expected = (opts.expectedKeys ?? []).map((k) => isKeyId(k) ? k : keyIdFor(k));
   let trust = "consistency-only";
@@ -383,6 +424,6 @@ export function verifyPackage(read, opts = {}) {
       strangers.length ? `sealed by ${strangers.join(", ")}, which the expected key did not hand over to` : "") ? "expected-key" : "untrusted";
   }
   const ok = results.every((r) => r.ok);
-  return { kind, ok, trust, signers: [...signers], expected_keys: expected,
+  return { kind, ok, trust, signers: [...signers], expected_keys: expected, buyer_signers: [...buyerSigners],
     passed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
 }

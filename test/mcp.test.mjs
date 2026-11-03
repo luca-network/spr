@@ -15,7 +15,7 @@ test("spr-mcp: an MCP client starts the server over stdio, as Claude Desktop doe
     await client.connect(new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL("../packages/spr-mcp/bin/spr-mcp.mjs", import.meta.url))],
       env: { ...process.env, SPR_AGENT_ID: "agt_desktop", SPR_ENTITY: "Example Co", SPR_DIR: dir, SPR_BINDING: "on" } }));
     const tools = (await client.listTools()).tools;
-    assert.deepEqual(tools.map((t) => t.name).sort(), ["cancel_intent", "check_payment", "export_package", "export_xbrl_csv", "get_intent", "list_records", "record_intent", "record_settlement", "verify_record"]);
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["cancel_intent", "check_payment", "export_dispute_pack", "export_package", "export_xbrl_csv", "get_intent", "list_records", "record_intent", "record_settlement", "verify_record"]);
     assert.equal(tools.find((t) => t.name === "verify_record").annotations?.readOnlyHint, true);
     const text = (r) => JSON.parse(r.content[0].text);
     const intent = text(await client.callTool({ name: "record_intent", arguments: { purpose: "Weather data for routing", max_amount_minor: 5000, currency: "USDC" } }));

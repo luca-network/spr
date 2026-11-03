@@ -2,6 +2,38 @@
 
 Versions apply to all four packages together: `@luca-network/spr`, `@luca-network/spr-sdk`, `@luca-network/spr-mcp` and `spr-sdk` for Python. The format is draft 1 throughout (`spr/draft-1`); a book written by any of these versions opens in any other.
 
+## 0.2.0 (3 November 2026)
+
+For merchants: the buyer's authorization and the evidence for a chargeback response. The format is still draft 1, and every book written by an earlier version opens unchanged. The version is 0.2.0 because a package may now hold three new files (`buyer-intents.jsonl`, `dispute.json`, `summary.txt`), which checkers before 0.2.0 refuse. A book that doesn't use them exports exactly as before.
+
+**New**
+- **The buyer's sealed intent, at the merchant.** `record_settlement` (`book.seal`) takes `buyer_intent`, the buyer's own sealed intent as its agent presented it at checkout, and `buyer_key`, the buyer's public key. The seal must check with that key or nothing is sealed. The record keeps the intent's ID, hash and key, and whether the payment was inside it (declared before, not expired, within the cap); the book keeps the buyer's intent and key in `buyer-intents.jsonl`.
+- **How the buyer authenticated.** `buyer_authentication`: `{ method, result, reference, eci, provider, sha256, at }`, where `method` is `3ds`, `passkey`, `network_token`, `otp`, `agent_mandate` or `other`. The evidence itself stays with the merchant or its processor.
+- Both can be added to a record already sealed, with no reason; a retry that leaves them out keeps them.
+- **Dispute packages.** `book.exportDisputePack(recordId, folder, { delivery })` (Python: `export_dispute_pack`; MCP: `export_dispute_pack`) writes one payment's evidence: every version of its record, the buyer's sealed intent and key, a sealed `dispute.json`, and the same statement in plain words in `summary.txt`, under a sealed manifest (SPEC section 8.1). The evidence supports a dispute response; whether to submit it is the merchant's decision, and the outcome is the card network's.
+- **Checking.** `spr-verify` and `python -m spr` take `--buyer-key` to check that every buyer's intent in a package is sealed by that buyer. `verifyPackage(read, { buyerKeys })` and `verify_package(read, expected_keys, buyer_keys)` do the same. A buyer's key never counts as the company's.
+- **xBRL-CSV.** A new column, `invoiceReference`. The RFC proposes concepts for the buyer's intent and authentication.
+
+## 0.1.11 (3 November 2026)
+
+New checks before paying. No change to the format's core fields; books written by earlier versions open unchanged. Upgrade if your agents pay invoices or pay over x402.
+
+**New**
+- **The payee.** `record_intent` takes `payee_id`, who is to be paid, as `scheme:value` (`wallet:0x…`, `domain:data.example`), sealed in the intent as `payee`. `check_payment` takes the `payee_id` the payment actually goes to and declines a payment to anyone else (`payee_matches_intent`). Wallet addresses, domains and email addresses are compared without regard to case.
+- **x402 checks the real payee.** `withLuca` now checks the address the seller's payment request asks to be paid, before anything is signed, and records it as the payee (`counterparty_id: wallet:…`). Before, it checked the payee the agent declared, so a tampered payment request or a prompt-injected payee could get through. Pass `payee_id` (or list your payees in `mandate.json`) to use it.
+- **The payees a mandate allows.** `mandate.json` may list `payees`; a payment to anyone else, or with no payee given, is declined (`approved_payee`). Keep `mandate.json` where the agent can't write, since an agent that can edit it can add a payee.
+- **The same invoice twice.** `check_payment` and `record_settlement` take `invoice_ref`. A second payment of an invoice already paid, or already approved under another intent, is declined (`not_already_paid`), naming the record or approval. A retry under the same intent is not a duplicate. `invoice_ref` is sealed in `payment_refs`.
+- **Repeats.** Where `mandate.json` sets `duplicate_window` (an ISO 8601 duration such as `P1D`), the same amount to the same payee within the window is declined (`not_a_repeat`).
+- Each pre-payment check now names the intent it checked (`intent_id`).
+
+## 0.1.10 (3 November 2026)
+
+No change to the format's core fields. Books written by earlier versions open unchanged. Upgrading is optional.
+
+**New**
+- **Order and processor references.** `record_settlement` (`book.seal`) takes `order_id`, the merchant's order ID, and `processor_transaction_id`, the payment processor's own transaction ID. They are sealed in the record as `payment_refs`, so the buyer's finance team, the merchant's, the processor and a card network can find the same payment. Either can be added to a record already sealed with no reason, which makes a new version; a retry that leaves them out keeps them; changing one needs `correction: { reason }`.
+- **xBRL-CSV.** Two new columns, `orderReference` and `processorTransactionReference`, proposed for the Machine Payment Profile during the comment period of RFC 0001.
+
 ## 0.1.9 (2 November 2026)
 
 No change to the format or to how any tool behaves. Upgrading is optional.

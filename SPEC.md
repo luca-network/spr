@@ -99,7 +99,9 @@ An intent is what an agent declares before paying. It is sealed with the company
 | `max_amount_minor` | the most the agent may pay under it, a positive integer, or null |
 | `currency` | the cap's currency, or null |
 
-An intent MAY also carry the agent, the mandate, the counterparty, the expected amount, the rail, the rail reference, the exact terms of the purchase and the pre-check against the mandate.
+An intent MAY also carry the agent, the mandate, the counterparty, the payee (`payee`: `{ scheme, value }`, such as `wallet` and an address), the expected amount, the rail, the rail reference, the exact terms of the purchase and the pre-check against the mandate.
+
+**A pre-payment check** (`luca.payment-check/0.1`) is a sealed answer, `approve` or `decline`, to whether one payment may be made, with each check and its result. A producer SHOULD check that the payment is inside an open intent (declared, not expired, not withdrawn, within the cap); that it goes to the payee the intent names, taking the payee from the payment request itself where the rail gives one; that it is within the book's limits, including any list of payees; and that the same invoice was not paid already. A payer that signs only after an approval keeps a declined payment from being made at all.
 
 **What a check against a book's own limits shows.** A company's book MAY hold limits for its agent (`mandate.json` in the SDKs). Whoever keeps the book writes them, so a check against them shows that the agent stayed inside limits the book declares. Producers report it as `authority: "self-declared"`, and `"none"` where the book holds no limits. It does not show that anyone else granted that authority. Authority granted by another party needs that party's own record or signature: a mandate approved in a hosted service, or one signed with a principal's key.
 
@@ -141,6 +143,8 @@ A record MAY carry any other member. Luca's records carry, among others:
 - the agent and how its registration was approved;
 - the mandate check, the match to the intent and the consent check (declared before payment, before expiry, not withdrawn, within the cap, and the binding status);
 - the rail's own authorization;
+- the merchant's order ID, the payment processor's transaction ID and the invoice paid (`payment_refs`);
+- at a merchant, the buyer's own sealed intent (`buyer_intent`: its ID, payload hash, the buyer's key ID, and the checks of the payment against it) and how the buyer authenticated at checkout (`buyer_authentication`: `method`, one of `3ds`, `passkey`, `network_token`, `otp`, `agent_mandate` or `other`, with its `result`, and optionally its `reference`, `eci`, `provider`, `sha256` of the evidence kept elsewhere, and `at`);
 - the classification to nature, function and account, with US GAAP and IFRS elements and the tax view;
 - FX, intercompany, disputes, revenue recognition, and the delivered terms compared with those declared.
 
@@ -184,6 +188,9 @@ A package is a folder of files that can be checked with nothing but this format.
 | `cancellations.jsonl` | one sealed withdrawal of an intent per line |
 | `checks.jsonl` | one sealed pre-payment check per line |
 | `records.jsonl` | one sealed record per line, every version |
+| `buyer-intents.jsonl` | at a merchant: one buyer's sealed intent per line, with the buyer's public key: `{ intent: { payload, seal }, key: { key_id, algorithm, public_pem, entity } }` |
+| `dispute.json` | in a dispute package (section 8.1): `{ dispute, seal }` |
+| `summary.txt` | in a dispute package: the dispute statement in plain words |
 | `manifest.json` | `{ package, seal }`, where `package` lists each file with its SHA-256 and is sealed with the company's key |
 
 A checker of a package MUST check:
@@ -196,7 +203,9 @@ A checker of a package MUST check:
 - that every superseded version is in the package;
 - that each record's intent is in the package with the hash the record names;
 - for a record whose consent check carries a nonce, that it is marked bound exactly when the nonce equals the intent nonce (section 5);
-- that no record ID holds two different records, and that no payment has two records with the same version number.
+- that no record ID holds two different records, and that no payment has two records with the same version number;
+- every buyer's intent in `buyer-intents.jsonl`: that its seal checks with the key beside it, that the key's ID is that key's, and its core fields; and that each record naming a buyer's intent finds it there, with the same ID, hash and key. A buyer's key never counts as one of the company's keys. A checker given the buyer's public keys MUST check that every buyer's intent is sealed by one of them;
+- in a dispute package, the seal of `dispute.json`, that each record it names is in the package, and that `summary.txt` has the hash it names.
 
 **Whose package it is.** The checks above use the keys the package carries, so they show the package is consistent: anyone can make a consistent package with a key of their own. A checker given the company's public keys, from the company itself, MUST also check that every seal is by one of them or by a key one of them handed over to (section 3). A checker SHOULD show which keys sealed the package, and MUST NOT present a result without the company's keys as proof of who made it.
 
@@ -205,6 +214,28 @@ A large book MAY be sent as several packages. Each one stands on its own: it hol
 A book's own folder also holds its private key (`key.pem` in the SDKs) and no manifest. A checker MAY check it as a book (every seal and core field, with no manifest) and SHOULD say to share an export instead. A package MUST NOT contain a private key, and a checker MUST fail one that does.
 
 Luca's monthly audit package (`luca.audit-package/1`) is a larger package of the same kind, with its own checker.
+
+A package holding `buyer-intents.jsonl`, `dispute.json` or `summary.txt` needs a checker from version 0.2.0 of the reference library; earlier checkers refuse those names.
+
+### 8.1 Dispute packages
+
+A dispute package holds one payment's evidence for a merchant answering a chargeback or a payment dispute: every version of the payment's record, the intents and withdrawals they name, the buyer's sealed intents they name with the buyer's keys, the company's keys, and two more files.
+
+`dispute.json` is `{ dispute, seal }`, sealed with the company's key, where `dispute` is:
+
+| Member | Meaning |
+|---|---|
+| `schema` | `luca.dispute-pack/0.1` |
+| `entity` | the company |
+| `record_id` | the payment's current version |
+| `records` | every version in the package |
+| `payment` | the rail, its reference, the amount, currency, time and direction |
+| `payment_refs`, `buyer_intent`, `buyer_authentication` | as the record holds them, or null |
+| `delivery` | how and when the order was delivered, as the company states it, or null |
+| `generated_at`, `producer` | when and by what it was made |
+| `summary_sha256` | the SHA-256 of `summary.txt` |
+
+`summary.txt` says the same in plain words, for a person reading the dispute. It states only what the package's sealed files show. The package supports a dispute response: whether to submit it is the company's decision, and the outcome is the card network's.
 
 ## 9. Conformance
 

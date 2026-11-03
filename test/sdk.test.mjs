@@ -537,3 +537,169 @@ test("xBRL-CSV: text that looks like a formula is written as text, and amounts a
     assert.match(csv, /,-5\.00,-500,/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("order and processor IDs: sealed when given, added later without a reason, kept on a retry, and exported to xBRL-CSV", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spr-refs-"));
+  try {
+    const book = new SprBook({ dir: join(dir, "book"), agentId: "agt_x", entity: "Example Co" });
+    const at = "2026-11-03T12:00:00Z", base = { rail: "stripe", source_id: "pi_1", amount_minor: 1999, currency: "USD", occurred_at: at };
+    book.seal(base);
+    assert.equal(book.records.at(-1).payload.payment_refs, undefined);
+    assert.equal(book.seal({ ...base, order_id: " ORD-1042 " }).status, "new_version");
+    assert.deepEqual(book.records.at(-1).payload.payment_refs, { order_id: "ORD-1042" });
+    const r3 = book.seal({ ...base, processor_transaction_id: "ch_3Pz" });
+    assert.deepEqual(book.records.at(-1).payload.payment_refs, { order_id: "ORD-1042", processor_transaction_id: "ch_3Pz" });
+    assert.equal(book.seal(base).status, "unchanged");
+    assert.equal(book.seal({ ...base, order_id: "ORD-9999" }).status, "conflict");
+    assert.equal(book.seal({ ...base, order_id: "ORD-9999", correction: { reason: "Wrong order" } }).status, "new_version");
+    assert.throws(() => book.seal({ ...base, source_id: "pi_2", order_id: "x".repeat(201) }), /200 characters/);
+    assert.equal(book.verifyRecord(r3.record_id).ok, true);
+    book.exportXbrlCsv(join(dir, "x"));
+    const [head, row] = readFileSync(join(dir, "x", "mpp-payments.csv"), "utf8").trim().split("\r\n");
+    const v = Object.fromEntries(head.split(",").map((c, k) => [c, row.split(",")[k]]));
+    assert.equal(v.orderReference, "ORD-9999");
+    assert.equal(v.processorTransactionReference, "ch_3Pz");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the payee check: a 402 that asks to pay someone else is declined before anything is signed, whether the intent or the mandate names the payee", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "spr-payee-"));
+  try {
+    const ATTACKER = "0x00000000000000000000000000000000000bad00";
+    // A seller whose payment request has been tampered with: it asks for the money to go to another address.
+    const tampered = (seen) => {
+      const real = standInSeller("10000", seen);
+      return async (input, init) => {
+        const res = await real(input, init);
+        const h = res.headers.get("PAYMENT-REQUIRED");
+        if (!h) return res;
+        const { decodePaymentRequiredHeader } = await import("@x402/core/http");
+        const r = decodePaymentRequiredHeader(h);
+        r.accepts = r.accepts.map((a) => ({ ...a, payTo: ATTACKER }));
+        return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(r) } });
+      };
+    };
+    const book = new SprBook({ dir: join(dir, "a"), agentId: "agt_research", entity: "Example Co" });
+    const account = privateKeyToAccount(generatePrivateKey());
+    const seen = { signatures: [], calls: 0 };
+    const pay = withLuca(book, { signer: account, fetch: tampered(seen) });
+    await assert.rejects(pay("https://data.example/prices", { luca: { purpose: "Market data", max_amount_minor: 20000, currency: "USDC", payee_id: `wallet:${SELLER}` } }),
+      (e) => e instanceof PaymentDeclinedByLuca && /payee_matches_intent/.test(e.message) && e.message.includes(ATTACKER));
+    assert.equal(seen.signatures.length, 0, "nothing was signed");
+    assert.equal(book.listRecords().length, 0);
+    // The honest seller, same payee: paid, and the record names the payee's address.
+    const ok = await withLuca(book, { signer: account, fetch: standInSeller("10000", seen) })("https://data.example/prices",
+      { luca: { purpose: "Market data", max_amount_minor: 20000, currency: "USDC", payee_id: `wallet:${SELLER.toUpperCase().replace("0X", "0x")}` } });
+    assert.equal(ok.luca.status, "paid");
+    assert.deepEqual(book.records.at(-1).payload.counterparty_ref, { type: null, identifier: { scheme: "wallet", value: SELLER } });
+
+    // With no payee in the intent, a mandate that lists its payees refuses anyone else.
+    const b2 = new SprBook({ dir: join(dir, "b"), agentId: "agt_research", entity: "Example Co" });
+    writeFileSync(join(dir, "b", "mandate.json"), JSON.stringify({ mandate_id: "m-1", payees: [`wallet:${SELLER}`, { id: "domain:veridian.example", name: "Veridian Data" }] }));
+    await assert.rejects(withLuca(b2, { signer: account, fetch: tampered(seen) })("https://data.example/prices", { luca: { purpose: "Market data", max_amount_minor: 20000, currency: "USDC" } }),
+      (e) => e instanceof PaymentDeclinedByLuca && /approved_payee/.test(e.message));
+    assert.equal(seen.signatures.length, 1, "only the honest payment was ever signed");
+    // check_payment on its own: no payee given against a mandate with a list is declined; one on the list is approved.
+    const i = b2.declare({ purpose: "Data", max_amount_minor: 500, currency: "USD" });
+    assert.equal(b2.checkPayment({ amount_minor: 100, currency: "USD", intent_id: i.intent_id }).decision, "decline");
+    assert.equal(b2.checkPayment({ amount_minor: 100, currency: "USD", intent_id: i.intent_id, payee_id: "domain:Veridian.Example" }).decision, "approve");
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
+});
+
+test("the duplicate check: an invoice is paid once; with duplicate_window, the same amount to the same payee is held; a retry under the same intent is not a duplicate", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "spr-dup-"));
+  try {
+    const book = new SprBook({ dir, agentId: "agt_ap", entity: "Example Co" });
+    const at = new Date().toISOString();
+    const i1 = book.declare({ purpose: "Pay invoice INV-7 from Acme", max_amount_minor: 50000, currency: "USD", payee_id: "domain:acme.example" });
+    const c1 = book.checkPayment({ amount_minor: 42000, currency: "USD", intent_id: i1.intent_id, payee_id: "domain:acme.example", invoice_ref: "INV-7" });
+    assert.equal(c1.decision, "approve", JSON.stringify(c1.reasons));
+    // The same intent asking again (a retry after a timeout) is not a duplicate.
+    assert.equal(book.checkPayment({ amount_minor: 42000, currency: "USD", intent_id: i1.intent_id, payee_id: "domain:acme.example", invoice_ref: "INV-7" }).decision, "approve");
+    book.seal({ rail: "stripe", source_id: "pi_inv7", amount_minor: 42000, currency: "USD", occurred_at: at, intent_id: i1.intent_id,
+      counterparty: "Acme", counterparty_id: "domain:acme.example", invoice_ref: "INV-7" });
+    assert.equal(book.records.at(-1).payload.payment_refs.invoice_ref, "INV-7");
+    // Another intent for the same invoice: declined, naming the record that paid it.
+    const i2 = book.declare({ purpose: "Pay Acme invoice INV-7", max_amount_minor: 50000, currency: "USD" });
+    const c2 = book.checkPayment({ amount_minor: 42000, currency: "USD", intent_id: i2.intent_id, payee_id: "domain:acme.example", invoice_ref: " INV-7 " });
+    assert.equal(c2.decision, "decline");
+    assert.match(c2.reasons.join(";"), /not_already_paid: Invoice INV-7 was already paid: LR-STRIPE-/);
+    // A different invoice from the same payee is fine while the book has no duplicate_window.
+    assert.equal(book.checkPayment({ amount_minor: 42000, currency: "USD", intent_id: i2.intent_id, payee_id: "domain:acme.example", invoice_ref: "INV-8" }).decision, "approve");
+
+    writeFileSync(join(dir, "mandate.json"), JSON.stringify({ mandate_id: "m-ap", duplicate_window: "P1D" }));
+    const i3 = book.declare({ purpose: "Pay Acme again", max_amount_minor: 50000, currency: "USD" });
+    const c3 = book.checkPayment({ amount_minor: 42000, currency: "USD", intent_id: i3.intent_id, payee_id: "domain:acme.example" });
+    assert.equal(c3.decision, "decline");
+    assert.match(c3.reasons.join(";"), /not_a_repeat: The same amount to domain:acme\.example within P1D/);
+    assert.equal(book.checkPayment({ amount_minor: 41999, currency: "USD", intent_id: i3.intent_id, payee_id: "domain:acme.example" }).decision, "approve");
+    writeFileSync(join(dir, "mandate.json"), JSON.stringify({ duplicate_window: "one day" }));
+    assert.throws(() => book.checkPayment({ amount_minor: 1, currency: "USD", intent_id: i3.intent_id, payee_id: "domain:acme.example" }), /duplicate_window/);
+    // Every check is sealed and the book still checks.
+    writeFileSync(join(dir, "mandate.json"), JSON.stringify({}));
+    assert.equal(book.exportPackage(join(dir, "..", `${dir.split(/[\\/]/).pop()}-export`)).verified, true);
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); rmSync(`${dir}-export`, { recursive: true, force: true }); }
+});
+
+test("a merchant's dispute pack: the buyer's sealed intent checks with the buyer's key, and the pack checks with the SPR library alone", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const { verifyPackage } = await import("@luca-network/spr");
+  const dir = mkdtempSync(join(tmpdir(), "spr-dispute-"));
+  try {
+    // The buyer's agent declares the purchase in the buyer's own book.
+    const buyer = new SprBook({ dir: join(dir, "buyer"), agentId: "agt_buyer", entity: "Northwind Analytics" });
+    const i = buyer.declare({ purpose: "Annual data licence from Example Store", max_amount_minor: 25000, currency: "USD", payee_id: "domain:store.example" });
+    const sealedIntent = { payload: buyer.intents.get(i.intent_id).payload, seal: buyer.intents.get(i.intent_id).seal };
+    const buyerKey = { public_pem: buyer.publicKey().public_pem, entity: "Northwind Analytics" };
+
+    // The merchant records the payment it received, with the buyer's intent presented at checkout.
+    const shop = new SprBook({ dir: join(dir, "shop"), agentId: "agt_checkout", entity: "Example Store" });
+    const at = new Date().toISOString();
+    const sale = { rail: "stripe", source_id: "pi_shop_1", amount_minor: 19999, currency: "USD", occurred_at: at, direction: "inflow", counterparty: "Northwind Analytics",
+      order_id: "ORD-1042", processor_transaction_id: "ch_3PzSHOP" };
+    // A changed intent, or one checked with another key, is refused and nothing is sealed.
+    assert.throws(() => shop.seal({ ...sale, buyer_intent: { ...sealedIntent, payload: { ...sealedIntent.payload, max_amount_minor: 99999 } }, buyer_key: buyerKey }), /does not check/);
+    assert.throws(() => shop.seal({ ...sale, buyer_intent: sealedIntent, buyer_key: { public_pem: shop.publicKey().public_pem } }), /not by the buyer key given/);
+    assert.equal(shop.listRecords().length, 0);
+    const r = shop.seal({ ...sale, buyer_intent: sealedIntent, buyer_key: buyerKey,
+      buyer_authentication: { method: "3ds", result: "authenticated", reference: "3ds-tx-77f1", eci: "05", provider: "Stripe", at } });
+    assert.equal(r.status, "recorded");
+    const rec = shop.records.at(-1).payload;
+    assert.equal(rec.buyer_intent.intent_id, i.intent_id);
+    assert.equal(rec.buyer_intent.key_id, buyer.keyId);
+    assert.equal(rec.buyer_intent.within_intent, true);
+    assert.equal(rec.buyer_authentication.method, "3ds"); assert.equal(rec.buyer_authentication.eci, "05");
+    assert.equal(Date.parse(rec.buyer_authentication.at), Date.parse(at));
+    assert.throws(() => shop.seal({ ...sale, source_id: "pi_x", buyer_authentication: { method: "fax", result: "ok" } }), /method is one of/);
+
+    // The dispute pack, with delivery, checks with the merchant's key and the buyer's.
+    const out = shop.exportDisputePack(r.record_id, join(dir, "dispute"), { delivery: { method: "digital", delivered_at: at, reference: "download-5521" } });
+    assert.equal(out.verified, true, JSON.stringify(out));
+    assert.match(out.summary, /order ORD-1042, processor transaction ch_3PzSHOP/);
+    assert.match(out.summary, /Northwind Analytics, through its agent agt_buyer/);
+    assert.match(out.summary, /passed declared before payment/);
+    assert.match(out.summary, /Buyer authentication: 3ds, authenticated, reference 3ds-tx-77f1, ECI 05, by Stripe/);
+    const read = (n) => existsSync(join(dir, "dispute", n)) ? readFileSync(join(dir, "dispute", n)) : null;
+    const v = verifyPackage(read, { expectedKeys: [shop.keyId], buyerKeys: [buyer.keyId] });
+    assert.equal(v.ok, true, JSON.stringify(v.results.filter((x) => !x.ok)));
+    assert.deepEqual(v.buyer_signers, [buyer.keyId]);
+    assert.equal(v.trust, "expected-key");
+    // Another buyer key expected: fails. An edited summary: fails.
+    assert.equal(verifyPackage(read, { expectedKeys: [shop.keyId], buyerKeys: [shop.keyId] }).ok, false);
+    writeFileSync(join(dir, "dispute", "summary.txt"), out.summary.replace("authenticated", "verified"));
+    assert.equal(verifyPackage(read, { expectedKeys: [shop.keyId] }).ok, false);
+    // The merchant's whole book, buyer intents included, still exports and checks.
+    assert.equal(shop.exportPackage(join(dir, "shop-export")).verified, true);
+
+    // Over the buyer's cap: recorded, marked outside the intent, and the summary says which check failed.
+    const r2 = shop.seal({ ...sale, source_id: "pi_shop_2", amount_minor: 30000, buyer_intent: sealedIntent, buyer_key: buyerKey });
+    assert.equal(shop.records.at(-1).payload.buyer_intent.within_intent, false);
+    assert.match(shop.exportDisputePack(r2.record_id, join(dir, "dispute2")).summary, /FAILED within intent cap/);
+    // A buyer's intent added after the payment was first recorded: a new version, no reason needed.
+    shop.seal({ ...sale, source_id: "pi_shop_3" });
+    assert.equal(shop.seal({ ...sale, source_id: "pi_shop_3", buyer_intent: sealedIntent, buyer_key: buyerKey }).status, "new_version");
+    assert.throws(() => shop.exportDisputePack("LR-NOPE-v1", join(dir, "d3")), /No record/);
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10 }); }
+});

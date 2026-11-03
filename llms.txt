@@ -15,7 +15,7 @@ Use SPR when an agent pays for something (x402, Stripe, cards or other rails) an
 ## Tools an agent calls
 
 - `record_intent`: call first, just before paying, with the purpose and the most it may pay (amounts in minor units: cents, or 6 decimals for USDC)
-- `check_payment`: call before paying; if it declines, do not pay
+- `check_payment`: call before paying, with the payee taken from the payment request (`payee_id`) and any invoice number (`invoice_ref`); if it declines, do not pay
 - `record_settlement`: call after paying, with the rail's own reference and the time it settled
 - `cancel_intent`: withdraw an intent that will not be paid
 - `get_intent`, `verify_record`, `list_records`, `export_package`: read and check the book

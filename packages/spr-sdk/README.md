@@ -15,7 +15,20 @@ Node.js 20 or later. The packages are ES modules: load them with `import`, not `
 
 The book runs on your machine and makes no call to Luca. Before and after each payment it checks the payment against the agent's declared intent: the cap, the expiry, and whether the intent was withdrawn.
 
-You can also put an optional `mandate.json` in the book's folder: one limit across all the agent's intents (currency, most per payment, dates). Whoever keeps the folder writes that file, so results report it as `authority: "self-declared"` (or `"none"` without one). It shows the agent kept to limits the company set for itself. Spending authority granted by someone else needs that party's own record, such as a mandate approved in Luca's hosted service.
+Before paying, `check_payment` also checks who is paid and whether it was paid already:
+
+- **The payee.** Give the intent a `payee_id` (`wallet:0x…`, `domain:data.example`) and a payment to anyone else is declined. The x402 wrapper checks the address the seller's payment request actually asks to be paid, before anything is signed, so a tampered request or a prompt-injected payee is refused.
+- **The same invoice twice.** Give `invoice_ref` to `check_payment` and `record_settlement`, and a second payment of that invoice is declined, naming the record that paid it.
+
+You can also put an optional `mandate.json` in the book's folder: one limit across all the agent's intents (currency, most per payment, dates), the payees it may pay (`payees`), and how long the same amount to the same payee counts as a repeat (`duplicate_window`, such as `P1D`):
+
+```json
+{ "mandate_id": "ap-2026", "currency": "USD", "max_per_payment_minor": 500000,
+  "payees": ["domain:acme.example", { "id": "wallet:0x59dd0305c70fdd714d9a022a1b0daf93e7dcec6d", "name": "Veridian Data" }],
+  "duplicate_window": "P1D" }
+```
+
+Keep `mandate.json` where the agent can't write: an agent that can edit the file can add its own payee. Whoever keeps the folder writes that file, so results report it as `authority: "self-declared"` (or `"none"` without one). It shows the agent kept to limits the company set for itself. Spending authority granted by someone else needs that party's own record, such as a mandate approved in Luca's hosted service.
 
 Times need their offset (`2026-10-28T19:00:00Z`); a time without one is refused. The same payment again returns `unchanged`. Different facts for a payment already sealed return `conflict` and seal nothing, unless you pass `correction: { reason }`, which is sealed into the new version.
 
@@ -27,6 +40,7 @@ import { withLuca } from "@luca-network/spr-sdk/x402";
 
 const book = new SprBook({ dir: "./books", agentId: "agt_research", entity: "Example Co" });
 const pay = withLuca(book, { signer: account });          // a viem account
+// In each call, luca: { purpose, max_amount_minor, currency, payee_id: "wallet:0x…", invoice_ref } (payee_id and invoice_ref optional)
 
 const res = await pay("https://data.example/prices", {
   luca: { purpose: "Market data for the pricing model", max_amount_minor: 20000, currency: "USDC" },
@@ -69,11 +83,27 @@ const book = new SprBook({ dir: "./books", agentId: "agt_research", entity: "Exa
 book.declare({ purpose: "Market data for the weekly pricing report", product: "pro-monthly", max_amount_minor: 20000000, currency: "USDC" });
 book.seal({ rail: "x402", source_id: txHash, amount_minor: 15000000, currency: "USDC", occurred_at, intent_id,
   network: "base", evidence_type: "onchain", settlement_provider: "facilitator.example",
-  counterparty_type: "service", counterparty_id: "domain:data.example", receipt: { ref: "s3://receipts/123.pdf", sha256 } });
+  counterparty_type: "service", counterparty_id: "domain:data.example", receipt: { ref: "s3://receipts/123.pdf", sha256 },
+  order_id: "ORD-1042", processor_transaction_id: "ch_3Pz" });
 book.exportXbrlCsv("./xbrl");   // mpp-report.json and mpp-payments.csv
 ```
 
 A `mandate.json` may also name its `issuer` and `scope`; each intent then carries the mandate's reference and a hash of it.
+
+## For merchants: buyer authorization and dispute evidence
+
+A merchant keeps its own book and records each payment it receives (`direction: "inflow"`). When the buyer's agent presents its sealed intent at checkout, record it with the buyer's public key; the book checks the seal with that key and compares the payment with the intent (declared before, not expired, within its cap). Add how the buyer authenticated, and the order and processor references:
+
+```js
+const r = shop.seal({ rail: "stripe", source_id: "pi_…", amount_minor: 19999, currency: "USD", occurred_at, direction: "inflow",
+  order_id: "ORD-1042", processor_transaction_id: "ch_3Pz…",
+  buyer_intent: sealedIntent, buyer_key: { public_pem: buyerPublicPem, entity: "Northwind Analytics" },
+  buyer_authentication: { method: "3ds", result: "authenticated", reference: "3ds-tx-…", eci: "05", provider: "Stripe", at } });
+const pack = shop.exportDisputePack(r.record_id, "./dispute-ORD-1042", { delivery: { method: "digital", delivered_at, reference: "download-5521" } });
+pack.summary;   // the evidence in plain words, for the dispute response
+```
+
+The folder holds every version of the record, the buyer's sealed intent and key, a sealed `dispute.json` and the same statement in `summary.txt`, under a sealed manifest. Anyone checks it with `spr-verify <folder> --key <merchant key> --buyer-key <buyer key>`. The evidence supports a dispute response; whether to submit it is the merchant's decision, and the outcome is the card network's.
 
 ## Labels
 

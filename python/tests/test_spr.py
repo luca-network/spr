@@ -382,3 +382,105 @@ class MachinePaymentProfile(unittest.TestCase):
             self.assertEqual(rec["counterparty_ref"], {"type": "service", "identifier": {"scheme": "domain", "value": "veridian.example"}})
             self.assertEqual(rec["receipt"], {"ref": "receipts/123.pdf", "sha256": sha, "kind": None})
             self.assertTrue(book.verify_record(r["record_id"])["ok"])
+
+
+class PaymentRefs(unittest.TestCase):
+    def test_order_and_processor_ids_are_sealed_and_can_be_added_later(self):
+        with tempfile.TemporaryDirectory() as d:
+            book = SprBook(dir=os.path.join(d, "book"), agent_id="agt_x", entity="Example Co")
+            at = "2026-11-03T12:00:00Z"
+            r = book.seal(rail="stripe", source_id="pi_1", amount_minor=1999, currency="USD", occurred_at=at)
+            self.assertNotIn("payment_refs", book.records[-1]["payload"])
+            # Added later, with no reason needed: a new version that keeps everything else.
+            r2 = book.seal(rail="stripe", source_id="pi_1", amount_minor=1999, currency="USD", occurred_at=at, order_id=" ORD-1042 ")
+            self.assertEqual(r2["status"], "new_version")
+            self.assertEqual(book.records[-1]["payload"]["payment_refs"], {"order_id": "ORD-1042"})
+            r3 = book.seal(rail="stripe", source_id="pi_1", amount_minor=1999, currency="USD", occurred_at=at, processor_transaction_id="ch_3Pz")
+            self.assertEqual(book.records[-1]["payload"]["payment_refs"], {"order_id": "ORD-1042", "processor_transaction_id": "ch_3Pz"})
+            # A retry without them keeps them; a different order ID is a correction and needs a reason.
+            self.assertEqual(book.seal(rail="stripe", source_id="pi_1", amount_minor=1999, currency="USD", occurred_at=at)["status"], "unchanged")
+            c = book.seal(rail="stripe", source_id="pi_1", amount_minor=1999, currency="USD", occurred_at=at, order_id="ORD-9999")
+            self.assertEqual(c["status"], "conflict")
+            self.assertEqual(book.seal(rail="stripe", source_id="pi_1", amount_minor=1999, currency="USD", occurred_at=at, order_id="ORD-9999",
+                                       correction={"reason": "Wrong order"})["status"], "new_version")
+            with self.assertRaises(ValueError):
+                book.seal(rail="stripe", source_id="pi_2", amount_minor=1, currency="USD", occurred_at=at, order_id="x" * 201)
+            self.assertTrue(book.verify_record(r3["record_id"])["ok"])
+
+
+class PayeeAndDuplicates(unittest.TestCase):
+    def test_payee_list_intent_payee_and_duplicates(self):
+        with tempfile.TemporaryDirectory() as d:
+            book = SprBook(dir=os.path.join(d, "book"), agent_id="agt_ap", entity="Example Co")
+            at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            i1 = book.declare(purpose="Pay invoice INV-7 from Acme", max_amount_minor=50000, currency="USD", payee_id="domain:acme.example")
+            bad = book.check_payment(amount_minor=42000, currency="USD", intent_id=i1["intent_id"], payee_id="wallet:0xBAD")
+            self.assertEqual(bad["decision"], "decline")
+            self.assertTrue(any(r.startswith("payee_matches_intent") for r in bad["reasons"]))
+            c1 = book.check_payment(amount_minor=42000, currency="USD", intent_id=i1["intent_id"], payee_id="domain:ACME.example", invoice_ref="INV-7")
+            self.assertEqual(c1["decision"], "approve", c1["reasons"])
+            self.assertEqual(book.check_payment(amount_minor=42000, currency="USD", intent_id=i1["intent_id"], payee_id="domain:acme.example", invoice_ref="INV-7")["decision"], "approve")
+            book.seal(rail="stripe", source_id="pi_inv7", amount_minor=42000, currency="USD", occurred_at=at, intent_id=i1["intent_id"],
+                      counterparty="Acme", counterparty_id="domain:acme.example", invoice_ref="INV-7")
+            self.assertEqual(book.records[-1]["payload"]["payment_refs"]["invoice_ref"], "INV-7")
+            i2 = book.declare(purpose="Pay Acme invoice INV-7", max_amount_minor=50000, currency="USD")
+            c2 = book.check_payment(amount_minor=42000, currency="USD", intent_id=i2["intent_id"], payee_id="domain:acme.example", invoice_ref=" INV-7 ")
+            self.assertEqual(c2["decision"], "decline")
+            self.assertTrue(any(r.startswith("not_already_paid: Invoice INV-7 was already paid: LR-STRIPE-") for r in c2["reasons"]))
+            with open(os.path.join(d, "book", "mandate.json"), "w", encoding="utf-8") as f:
+                json.dump({"mandate_id": "m-ap", "duplicate_window": "P1D", "payees": ["domain:acme.example", {"id": "wallet:0x59dd", "name": "Seller"}]}, f)
+            i3 = book.declare(purpose="Pay Acme again", max_amount_minor=50000, currency="USD")
+            c3 = book.check_payment(amount_minor=42000, currency="USD", intent_id=i3["intent_id"], payee_id="domain:acme.example")
+            self.assertEqual(c3["decision"], "decline")
+            self.assertTrue(any(r.startswith("not_a_repeat: The same amount to domain:acme.example within P1D") for r in c3["reasons"]))
+            self.assertEqual(book.check_payment(amount_minor=41999, currency="USD", intent_id=i3["intent_id"], payee_id="domain:acme.example")["decision"], "approve")
+            self.assertEqual(book.check_payment(amount_minor=100, currency="USD", intent_id=i3["intent_id"], payee_id="wallet:0x59DD")["decision"], "approve")
+            off = book.check_payment(amount_minor=100, currency="USD", intent_id=i3["intent_id"], payee_id="wallet:0xother")
+            self.assertTrue(any(r.startswith("approved_payee") for r in off["reasons"]))
+            self.assertEqual(book.check_payment(amount_minor=100, currency="USD", intent_id=i3["intent_id"])["decision"], "decline")
+
+
+class DisputePack(unittest.TestCase):
+    def test_buyer_intent_authentication_and_the_dispute_pack(self):
+        from spr import verify_folder
+        with tempfile.TemporaryDirectory() as d:
+            buyer = SprBook(dir=os.path.join(d, "buyer"), agent_id="agt_buyer", entity="Northwind Analytics")
+            i = buyer.declare(purpose="Annual data licence from Example Store", max_amount_minor=25000, currency="USD", payee_id="domain:store.example")
+            sealed = {"payload": buyer.intents[i["intent_id"]]["payload"], "seal": buyer.intents[i["intent_id"]]["seal"]}
+            bkey = {"public_pem": buyer.public_key()["public_pem"], "entity": "Northwind Analytics"}
+            shop = SprBook(dir=os.path.join(d, "shop"), agent_id="agt_checkout", entity="Example Store")
+            at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            sale = dict(rail="stripe", source_id="pi_shop_1", amount_minor=19999, currency="USD", occurred_at=at, direction="inflow",
+                        counterparty="Northwind Analytics", order_id="ORD-1042", processor_transaction_id="ch_3PzSHOP")
+            tampered = {"payload": {**sealed["payload"], "max_amount_minor": 99999}, "seal": sealed["seal"]}
+            with self.assertRaisesRegex(ValueError, "does not check"):
+                shop.seal(**sale, buyer_intent=tampered, buyer_key=bkey)
+            with self.assertRaisesRegex(ValueError, "not by the buyer key given"):
+                shop.seal(**sale, buyer_intent=sealed, buyer_key={"public_pem": shop.public_key()["public_pem"]})
+            with self.assertRaisesRegex(ValueError, "method is one of"):
+                shop.seal(**{**sale, "source_id": "pi_x"}, buyer_authentication={"method": "fax", "result": "ok"})
+            self.assertEqual(len(shop.list_records()), 0)
+            r = shop.seal(**sale, buyer_intent=sealed, buyer_key=bkey,
+                          buyer_authentication={"method": "3ds", "result": "authenticated", "reference": "3ds-tx-77f1", "eci": "05", "provider": "Stripe", "at": at})
+            rec = shop.records[-1]["payload"]
+            self.assertEqual(rec["buyer_intent"]["key_id"], buyer.key_id)
+            self.assertTrue(rec["buyer_intent"]["within_intent"])
+            out = shop.export_dispute_pack(r["record_id"], os.path.join(d, "dispute"), delivery={"method": "digital", "delivered_at": at, "reference": "download-5521"})
+            self.assertTrue(out["verified"], out)
+            self.assertIn("order ORD-1042, processor transaction ch_3PzSHOP", out["summary"])
+            self.assertIn("Northwind Analytics, through its agent agt_buyer", out["summary"])
+            self.assertIn("Buyer authentication: 3ds, authenticated, reference 3ds-tx-77f1, ECI 05, by Stripe", out["summary"])
+            v = verify_folder(os.path.join(d, "dispute"), [shop.key_id], [buyer.key_id])
+            self.assertTrue(v["ok"], [x for x in v["results"] if not x["ok"]])
+            self.assertEqual(v["buyer_signers"], [buyer.key_id])
+            self.assertFalse(verify_folder(os.path.join(d, "dispute"), [shop.key_id], [shop.key_id])["ok"])
+            with open(os.path.join(d, "dispute", "summary.txt"), "a", encoding="utf-8") as f:
+                f.write("Also: approved by the bank.\n")
+            self.assertFalse(verify_folder(os.path.join(d, "dispute"), [shop.key_id])["ok"])
+            self.assertTrue(shop.export_package(os.path.join(d, "shop-export"))["verified"])
+            r2 = shop.seal(**{**sale, "source_id": "pi_shop_2", "amount_minor": 30000}, buyer_intent=sealed, buyer_key=bkey)
+            self.assertFalse(shop.records[-1]["payload"]["buyer_intent"]["within_intent"])
+            self.assertIn("FAILED within intent cap", shop.export_dispute_pack(r2["record_id"], os.path.join(d, "dispute2"))["summary"])
+            shop.seal(**{**sale, "source_id": "pi_shop_3"})
+            self.assertEqual(shop.seal(**{**sale, "source_id": "pi_shop_3"}, buyer_intent=sealed, buyer_key=bkey)["status"], "new_version")
+

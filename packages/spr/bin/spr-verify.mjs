@@ -3,7 +3,7 @@
 // key it names, the core fields, version chains, each record's intent, the intent nonce where a record says the
 // payment was bound, and every key handover.
 //
-//   spr-verify <package folder> [--key <public key file or key ID>]... [--json]
+//   spr-verify <package folder> [--key <public key file or key ID>]... [--buyer-key <public key file or key ID>]... [--json]
 //   spr-verify --vectors        checks this library against vectors/vectors.json
 //
 // Without --key the result shows the package is consistent with the keys it carries: anyone can make a consistent
@@ -25,14 +25,19 @@ if (args.includes("--vectors")) {
   else { for (const r of out.results) console.log(`  ${r.ok ? "PASS" : "FAIL"}  ${r.what}${r.ok || !r.detail ? "" : `\n        ${r.detail}`}`); console.log(`\n${out.passed} passed, ${out.failed} failed`); }
   process.exit(out.failed ? 1 : 0);
 }
-const keys = [], rest = [];
+const keys = [], buyers = [], rest = [];
 for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--key") { const v = args[++i]; if (!v) { console.error("--key needs a public key file or a key ID"); process.exit(2); } keys.push(v); }
+  if (args[i] === "--key" || args[i] === "--buyer-key") {
+    const flag = args[i], v = args[++i];
+    if (!v) { console.error(`${flag} needs a public key file or a key ID`); process.exit(2); }
+    (flag === "--key" ? keys : buyers).push(v);
+  }
   else if (!args[i].startsWith("--")) rest.push(args[i]);
 }
 const dir = rest[0];
-if (!dir) { console.error("usage: spr-verify <package folder> [--key <public key file or key ID>]... [--json] | --vectors"); process.exit(2); }
-const expectedKeys = keys.map((k) => /^ed25519:[0-9a-f]{16}$/.test(k) ? k : readFileSync(k, "utf8"));
+if (!dir) { console.error("usage: spr-verify <package folder> [--key <public key file or key ID>]... [--buyer-key <public key file or key ID>]... [--json] | --vectors"); process.exit(2); }
+const load = (ks) => ks.map((k) => /^ed25519:[0-9a-f]{16}$/.test(k) ? k : readFileSync(k, "utf8"));
+const expectedKeys = load(keys), buyerKeys = load(buyers);
 
 // Only the package's own files, read from inside its folder: no other names, no links, nothing outside.
 const root = realpathSync(resolve(dir));
@@ -45,7 +50,7 @@ const read = (name) => {
   if (!real.startsWith(root + sep)) throw new Error(`${name} is outside the package folder`);
   return readFileSync(real);
 };
-const out = verifyPackage(read, { expectedKeys });
+const out = verifyPackage(read, { expectedKeys, buyerKeys });
 if (asJson) console.log(JSON.stringify(out, null, 2));
 else {
   console.log(`  Sealed by: ${out.signers.join(", ") || "nothing sealed"}`);

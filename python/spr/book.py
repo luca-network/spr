@@ -27,11 +27,11 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from . import format as L
 
-SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.1.9"}
+SDK_PRODUCER = {"name": "spr-sdk-python", "version": "0.2.0"}
 RECORD_SCHEMA = "luca.record/0.7"
 INTENT_SCHEMA = "luca.intent/0.1"
 CLOCK_SKEW = timedelta(minutes=2)
-FILES = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"]
+FILES = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl", "buyer-intents.jsonl"]
 # One writer at a time: each write takes book.lock, reads what other processes appended since, writes, and lets go.
 LOCK_WAIT = 10.0
 LOCK_STALE = 30.0
@@ -170,6 +170,109 @@ def _evidence_of(source_id, evidence, evidence_type, network, provider):
     return {**built, **(evidence or {})}
 
 
+# The merchant's order ID and the processor's transaction ID: what a merchant's or a buyer's finance team, a
+# processor and a card network use to find the same payment.
+_REF_FIELDS = ("order_id", "processor_transaction_id", "invoice_ref")
+
+
+def _ref_text(v):
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def _payee_key(v):
+    """One payee, however it is written: wallet addresses, domains and email addresses don't depend on case."""
+    ident = _identifier_of(v)
+    if not ident:
+        return None
+    scheme = (ident["scheme"] or "").lower()
+    value = ident["value"].strip()
+    if scheme in ("wallet", "domain", "email") or re.fullmatch(r"0x[0-9a-fA-F]+", value):
+        value = value.lower()
+    return f"{scheme}:{value}" if scheme else value
+
+
+def _payment_refs_of(given_refs: dict, earlier) -> Optional[dict]:
+    given = {}
+    for k in _REF_FIELDS:
+        v = given_refs.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str) or not v.strip() or len(v) > 200:
+            raise ValueError(f"{k} is the reference as text, up to 200 characters")
+        given[k] = v.strip()
+    # A retry that leaves them out keeps the ones first sealed; one that adds them keeps the others.
+    refs = {**((earlier or {}).get("payment_refs") or {}), **given}
+    return {k: refs[k] for k in _REF_FIELDS if k in refs} or None
+
+
+# How the buyer proved it was them at checkout: a 3-D Secure result, a passkey, a network token's cryptogram, a
+# one-time code, or the buyer's own signed mandate. The evidence itself stays with the merchant or its processor.
+AUTH_METHODS = ("3ds", "passkey", "network_token", "otp", "agent_mandate", "other")
+
+
+def _buyer_auth_of(a) -> Optional[dict]:
+    if a is None:
+        return None
+    if not isinstance(a, dict):
+        raise ValueError("buyer_authentication is a dict: {method, result, reference, sha256, at}")
+    if a.get("method") not in AUTH_METHODS:
+        raise ValueError(f"buyer_authentication.method is one of {', '.join(AUTH_METHODS)}")
+    if not isinstance(a.get("result"), str) or not a["result"].strip():
+        raise ValueError("buyer_authentication.result says how it ended, such as authenticated, attempted or failed")
+    sha = a.get("sha256")
+    if sha is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+        raise ValueError("buyer_authentication.sha256 is the evidence's SHA-256 in hexadecimal (64 characters)")
+    out = {"method": a["method"], "result": a["result"].strip()}
+    for k in ("reference", "eci", "provider"):
+        if a.get(k) is not None:
+            out[k] = str(a[k])
+    if sha is not None:
+        out["sha256"] = sha.lower()
+    if a.get("at") is not None:
+        out["at"] = _iso(_instant(a["at"], "buyer_authentication.at"))
+    return out
+
+
+_ZERO_DECIMALS = {"JPY", "KRW", "VND", "CLP", "ISK", "UGX", "XAF", "XOF", "PYG", "RWF", "KMF", "GNF", "DJF", "BIF", "VUV", "XPF"}
+_THREE_DECIMALS = {"BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"}
+_TOKEN_DECIMALS = {"USDC": 6, "USDT": 6, "EURC": 6, "PYUSD": 6, "USDG": 6}
+
+
+def _money(minor: int, currency: str) -> str:
+    d = _TOKEN_DECIMALS.get(currency, 0 if currency in _ZERO_DECIMALS else 3 if currency in _THREE_DECIMALS else 2)
+    s = str(abs(minor)).rjust(d + 1, "0")
+    return f"{s[:-d]}.{s[-d:]} {currency}" if d else f"{s} {currency}"
+
+
+def _dispute_summary(p: dict, delivery: Optional[dict], key_id: str) -> str:
+    """The dispute package's statement in plain words. Every line says what a sealed file in the package shows."""
+    out = [f"Payment evidence for {p['record_id']}", ""]
+    out.append(f"Payment: {_money(p['amount_minor'], p['currency'])} {'received by' if p.get('direction') == 'inflow' else 'paid by'} {p['entity']} on {p.get('occurred_at') or p.get('settled_on')}, {p['rail']} reference {p['source']['id']}.")
+    refs = p.get("payment_refs") or {}
+    parts = [x for x in (refs.get("order_id") and f"order {refs['order_id']}", refs.get("processor_transaction_id") and f"processor transaction {refs['processor_transaction_id']}",
+                         refs.get("invoice_ref") and f"invoice {refs['invoice_ref']}") if x]
+    if parts:
+        out.append(f"References: {', '.join(parts)}.")
+    b = p.get("buyer_intent")
+    if b:
+        out.append(f"Authorized by: {b.get('entity') or 'the buyer'}{', through its agent ' + b['agent'] if b.get('agent') else ''}. Before paying, it declared this purchase: \"{b['purpose']}\" (intent {b['intent_id']}). The declaration is sealed with the buyer's own key, {b['key_id']}, and checks with it.")
+        out.append("Against that declaration: " + "; ".join(f"{'passed' if c['ok'] else 'FAILED'} {c['check'].replace('_', ' ')} ({c['detail']})" for c in b["checks"]) + ".")
+    else:
+        out.append("Authorized by: no buyer's intent is recorded for this payment.")
+    a = p.get("buyer_authentication")
+    if a:
+        out.append(f"Buyer authentication: {a['method']}, {a['result']}" + (f", reference {a['reference']}" if a.get("reference") else "") + (f", ECI {a['eci']}" if a.get("eci") else "")
+                   + (f", by {a['provider']}" if a.get("provider") else "") + (f", at {a['at']}" if a.get("at") else "") + (f"; the evidence's SHA-256 is {a['sha256']}" if a.get("sha256") else "") + ".")
+    else:
+        out.append("Buyer authentication: none recorded.")
+    if delivery:
+        out.append("Delivery: " + ", ".join(x for x in (delivery.get("method"), delivery.get("delivered_at") and f"delivered {delivery['delivered_at']}",
+                                                       delivery.get("reference") and f"reference {delivery['reference']}", delivery.get("sha256") and f"proof SHA-256 {delivery['sha256']}") if x) + ".")
+    out.append("")
+    out.append(f"Every statement above comes from a file in this package sealed with {p['entity']}'s key {key_id}, or with the buyer's own key. Check the package with: spr-verify <folder> --key {key_id}")
+    return "\n".join(out) + "\n"
+
+
 def _profile_facts_of(counterparty_type, counterparty_id, receipt):
     out, ident = {}, _identifier_of(counterparty_id)
     if counterparty_type or ident:
@@ -297,6 +400,8 @@ class SprBook:
         self.records = []
         self._by_payment = {}
         self.labels = []
+        self.approved_checks = []  # pre-payment checks that approved, for the duplicate check
+        self.buyer_intents = {}  # payload hash -> {intent, key}: buyers' own sealed intents, kept by a merchant
 
     def _refresh(self):
         for n in FILES:
@@ -336,6 +441,10 @@ class SprBook:
             self._by_payment[_payment_key(row["payload"])] = row
         elif name == "labels.jsonl":
             self.labels.append(row)
+        elif name == "checks.jsonl" and row["payload"].get("decision") == "approve":
+            self.approved_checks.append(row["payload"])
+        elif name == "buyer-intents.jsonl":
+            self.buyer_intents[L.normalize_seal(row["intent"]["seal"])["payload_sha256"]] = row
 
     def _locked(self, fn):
         if self._depth > 0:
@@ -438,7 +547,8 @@ class SprBook:
     def _local_date(self, at: datetime) -> str:
         return at.astimezone(self._zone).strftime("%Y-%m-%d")
 
-    def _mandate_checks(self, amount, currency, at):
+    def _mandate_checks(self, amount, currency, at, payee=...):
+        # With a payee given (... skips it), a mandate that lists its payees is checked against it too.
         m = self._mandate()
         if not m:
             return {"decision": "none", "authority": "none", "checks": [], "mandate_id": None}
@@ -450,6 +560,12 @@ class SprBook:
         if m.get("valid_from") or m.get("valid_until"):
             ok = (not m.get("valid_from") or at >= _parse(m["valid_from"])) and (not m.get("valid_until") or at <= _parse(m["valid_until"]))
             checks.append({"check": "in_date", "ok": ok, "detail": f"Valid {m.get('valid_from') or 'any time'} to {m.get('valid_until') or 'no end'}"})
+        if isinstance(m.get("payees"), list) and payee is not ...:
+            listed = [k for k in (_payee_key(x["id"] if isinstance(x, dict) and not x.get("value") else x) for x in m["payees"]) if k]
+            ok = payee is not None and payee in listed
+            detail = ("No payee given, and the mandate pays only the payees it lists" if payee is None
+                      else f"{payee} is on the mandate's list of payees" if ok else f"{payee} is not on the mandate's list of payees")
+            checks.append({"check": "approved_payee", "ok": ok, "detail": detail})
         return {"decision": "within_mandate" if all(c["ok"] for c in checks) else "outside_mandate", "authority": SELF_DECLARED, "checks": checks,
                 "mandate_id": m.get("mandate_id")}
 
@@ -458,7 +574,7 @@ class SprBook:
     def declare(self, purpose: str, max_amount_minor: Optional[int] = None, currency: Optional[str] = None, counterparty: Optional[str] = None,
                 expected_amount_minor: Optional[int] = None, rail: Optional[str] = None, rail_ref: Optional[dict] = None,
                 terms: Optional[dict] = None, expires_in: Optional[str] = None, expires_in_hours: Optional[int] = None,
-                product: Optional[str] = None) -> dict:
+                product: Optional[str] = None, payee_id=None) -> dict:
         if not (purpose or "").strip():
             raise ValueError("purpose is required: why you are paying, in one sentence")
         cap = max_amount_minor
@@ -469,12 +585,13 @@ class SprBook:
         now = self._now()
         ttl = _duration(expires_in) if expires_in else timedelta(hours=expires_in_hours or 72)
         cur = currency.upper() if currency else None
-        pre = self._mandate_checks(cap if cap is not None else expected_amount_minor, cur, now)
+        payee = _identifier_of(payee_id) if payee_id else None
+        pre = self._mandate_checks(cap if cap is not None else expected_amount_minor, cur, now, _payee_key(payee) if payee else ...)
         payload = {
             "schema": INTENT_SCHEMA, "intent_id": "int_" + secrets.token_hex(10),
             "agent": self._agent_info(), "entity": self.entity, **self._principal_info(), "mandate_id": pre.get("mandate_id"),
             **({"mandate": _mandate_ref_of(self._mandate())} if self._mandate() else {}),
-            "purpose": purpose.strip(), "counterparty": counterparty, "expected_amount_minor": expected_amount_minor,
+            "purpose": purpose.strip(), "counterparty": counterparty, **({"payee": payee} if payee else {}), "expected_amount_minor": expected_amount_minor,
             "max_amount_minor": cap, "currency": cur, "rail": rail, "rail_ref": rail_ref, "terms": terms, **({"product": str(product)} if product else {}),
             "declared_at": _iso(now), "expires_at": _iso(now + ttl), "precheck": {"decision": pre["decision"], "authority": pre["authority"], "checks": pre["checks"]},
             "producer": self.producer,
@@ -547,25 +664,69 @@ class SprBook:
 
     @_writes
     def check_payment(self, amount_minor: int, currency: str, counterparty: Optional[str] = None, intent_id: Optional[str] = None,
-                      nonce: Optional[str] = None,
+                      nonce: Optional[str] = None, payee_id=None, invoice_ref: Optional[str] = None,
                       ) -> dict:
         now = self._now()
+        payee = _payee_key(payee_id)
         cur = currency.upper()
         i = self._intent_for(intent_id, nonce)
         consent = self._consent(i, now, amount_minor, cur, nonce) if i else None
-        m = self._mandate_checks(abs(amount_minor), cur, now)
+        m = self._mandate_checks(abs(amount_minor), cur, now, payee)
+        intent_payee = _payee_key(i["payload"]["payee"]) if i and i["payload"].get("payee") else None
         checks = [{"check": "open_intent", "ok": bool(i), "detail": f"Intent {i['payload']['intent_id']}" if i else "No intent named or matched by the nonce"}]
-        checks += [c for c in (consent or {}).get("checks", []) if c["severity"] == "hard"] + m["checks"]
-        request = {"amount_minor": amount_minor, "currency": currency, "counterparty": counterparty, "intent_id": intent_id, "nonce": nonce}
+        checks += [c for c in (consent or {}).get("checks", []) if c["severity"] == "hard"]
+        if intent_payee:
+            checks.append({"check": "payee_matches_intent", "ok": payee == intent_payee,
+                           "detail": f"Paying {payee}, the payee the intent named" if payee == intent_payee else f"The intent named {intent_payee}; this payment is to {payee or 'a payee not given'}"})
+        checks += m["checks"]
+        checks += self._duplicate_checks(_ref_text(invoice_ref), payee, counterparty, abs(amount_minor), cur, now, i["payload"]["intent_id"] if i else None)
+        request = {"amount_minor": amount_minor, "currency": currency, "counterparty": counterparty, "intent_id": intent_id, "nonce": nonce,
+                   "payee_id": payee_id, "invoice_ref": invoice_ref}
         row = self._seal_row({"schema": "luca.payment-check/0.1", "id": "pck_" + secrets.token_hex(8), "checked_at": _iso(now), "agent": self.agent_id,
+                              "intent_id": i["payload"]["intent_id"] if i else None,
                               "request": {k: v for k, v in request.items() if v is not None}, "decision": "approve" if all(c["ok"] for c in checks) else "decline",
                               "authority": m["authority"], "checks": checks, "producer": self.producer})
         self._append("checks.jsonl", row)
+        if row["payload"]["decision"] == "approve":
+            self.approved_checks.append(row["payload"])
         return {"id": row["payload"]["id"], "decision": row["payload"]["decision"], "authority": m["authority"], "checks": checks,
                 "reasons": [f"{c['check']}: {c['detail']}" for c in checks if not c["ok"]], "seal": row["seal"]}
 
     def _current(self):
         return list(self._by_payment.values())
+
+    def _duplicate_checks(self, invoice, payee, counterparty, amount, currency, at, intent_id):
+        """The same invoice paid twice, or (where the mandate sets duplicate_window) the same amount to the same payee again
+        within the window. Payments already recorded count, and so do approvals under another intent, since a payment
+        approved a moment ago may not be recorded yet. A retry under the same intent is not a duplicate."""
+        out = []
+        party_of = lambda pk, name: pk or (f"name:{name}" if name else None)
+        party = party_of(payee, counterparty)
+        rec_party = lambda r: party_of(_payee_key((r.get("counterparty_ref") or {}).get("identifier")), r.get("counterparty"))
+        chk_party = lambda c: party_of(_payee_key((c.get("request") or {}).get("payee_id")), (c.get("request") or {}).get("counterparty"))
+        other_intent = lambda c: (c.get("intent_id") or (c.get("request") or {}).get("intent_id")) != intent_id
+        outflows = [r["payload"] for r in self._current() if r["payload"].get("direction") != "inflow" and r["payload"].get("state") != "refunded"]
+        if invoice:
+            same = lambda x: not party or not x or x == party
+            paid = next((r for r in outflows if (r.get("payment_refs") or {}).get("invoice_ref") == invoice and same(rec_party(r))), None)
+            appr = next((c for c in self.approved_checks if _ref_text((c.get("request") or {}).get("invoice_ref")) == invoice and other_intent(c) and same(chk_party(c))), None)
+            detail = (f"Invoice {invoice} was already paid: {paid['record_id']}" if paid else
+                      f"Invoice {invoice} was already approved for payment: {appr['id']}" if appr else f"Invoice {invoice} has not been paid before")
+            out.append({"check": "not_already_paid", "ok": not paid and not appr, "detail": detail})
+        w = (self._mandate() or {}).get("duplicate_window")
+        if w and party:
+            try:
+                since = at - _duration(w)
+            except ValueError:
+                raise ValueError(f"duplicate_window in mandate.json must be an ISO 8601 duration such as P1D or PT12H, got {w}")
+            same_amount = lambda a, c: abs(a) == amount and str(c or "").upper() == currency
+            paid = next((r for r in outflows if rec_party(r) == party and same_amount(r["amount_minor"], r["currency"]) and _parse(r["occurred_at"]) >= since), None)
+            appr = next((c for c in self.approved_checks if chk_party(c) == party and other_intent(c)
+                         and same_amount((c.get("request") or {}).get("amount_minor") or 0, (c.get("request") or {}).get("currency")) and _parse(c["checked_at"]) >= since), None)
+            hit = paid["record_id"] if paid else appr["id"] if appr else None
+            out.append({"check": "not_a_repeat", "ok": not hit,
+                        "detail": f"The same amount to {party} within {w}: {hit}" if hit else f"No payment of the same amount to {party} within {w}"})
+        return out
 
     # ---- after paying ----
     @_writes
@@ -574,6 +735,8 @@ class SprBook:
              nonce: Optional[str] = None, evidence: Optional[dict] = None, correction: Optional[dict] = None,
              network: Optional[str] = None, evidence_type: Optional[str] = None, settlement_provider: Optional[str] = None,
              counterparty_type: Optional[str] = None, counterparty_id=None, receipt: Optional[dict] = None,
+             order_id: Optional[str] = None, processor_transaction_id: Optional[str] = None, invoice_ref: Optional[str] = None,
+             buyer_intent: Optional[dict] = None, buyer_key=None, buyer_authentication: Optional[dict] = None,
              ) -> dict:
         if not rail or not source_id:
             raise ValueError("rail and source_id are required")
@@ -594,9 +757,21 @@ class SprBook:
         if intent_id and not i:
             raise KeyError(f"No intent {intent_id} in this book")
         consent = self._consent(i, at, amount_minor, cur, nonce) if i and direction == "outflow" else None
+        refs = _payment_refs_of({"order_id": order_id, "processor_transaction_id": processor_transaction_id, "invoice_ref": invoice_ref},
+                                earlier["payload"] if earlier else None)
+        # At a merchant: the buyer's own sealed intent, checked with the buyer's key, and how the buyer authenticated.
+        buyer = self._buyer_intent_of(buyer_intent, buyer_key, at, amount_minor, cur) if buyer_intent else None
+        b_intent = buyer["ref"] if buyer else (earlier["payload"].get("buyer_intent") if earlier else None)
+        b_auth = _buyer_auth_of(buyer_authentication) or (earlier["payload"].get("buyer_authentication") if earlier else None)
         facts = {"direction": direction, "state": "refunded" if amount_minor < 0 else "pending" if state == "pending" else "cleared",
                  "amount_minor": amount_minor, "currency": cur, "occurred_at": _iso(at), "counterparty": counterparty, "memo": memo,
                  "intent": {"intent_id": i["payload"]["intent_id"], "payload_sha256": i["seal"]["payload_sha256"]} if i else None}
+        if refs:
+            facts["payment_refs"] = refs
+        if b_intent:
+            facts["buyer_intent"] = b_intent
+        if b_auth:
+            facts["buyer_authentication"] = b_auth
         # The same facts again are a retry. Different facts under the same payment are a correction, and need a reason;
         # only a pending payment clearing is taken as it comes.
         fix = None
@@ -604,7 +779,11 @@ class SprBook:
             changed = [k for k, v in facts.items() if L.canonicalize(v) != L.canonicalize(earlier["payload"].get(k))]
             if not changed:
                 return {"status": "unchanged", "record_id": earlier["payload"]["record_id"], "seal": earlier["seal"]}
-            clearing = changed == ["state"] and earlier["payload"].get("state") == "pending"
+            # Taken as it comes: a pending payment clearing, and an order or processor reference added where none was sealed.
+            had = earlier["payload"].get("payment_refs") or {}
+            added = lambda k: ((k == "payment_refs" and all((refs or {}).get(f) == v for f, v in had.items()))
+                               or (k in ("buyer_intent", "buyer_authentication") and k not in earlier["payload"]))
+            clearing = all((k == "state" and earlier["payload"].get("state") == "pending") or added(k) for k in changed)
             reason = (correction or {}).get("reason")
             reason = reason.strip() if isinstance(reason, str) else ""
             if not clearing and not reason:
@@ -618,6 +797,7 @@ class SprBook:
                         "counterparty": counterparty, "intent_id": intent_id, "memo": memo, "state": state, "nonce": nonce, "evidence": evidence,
                         "network": network, "evidence_type": evidence_type, "settlement_provider": settlement_provider,
                         "counterparty_type": counterparty_type, "counterparty_id": counterparty_id, "receipt": receipt,
+                        "order_id": order_id, "processor_transaction_id": processor_transaction_id, "invoice_ref": invoice_ref,
                         }.items() if v is not None}
         payload = {
             "schema": RECORD_SCHEMA, "record_id": f"LR-{rail.upper()}-{L.sha256_hex(key)[:10].upper()}-v{version}",
@@ -637,6 +817,10 @@ class SprBook:
         problems = L.check_record(payload)["problems"]
         if problems:
             raise ValueError(f"The record would not meet SPR: {'; '.join(problems)}")
+        if buyer and buyer["ref"]["payload_sha256"] not in self.buyer_intents:
+            b = {"intent": buyer["intent"], "key": buyer["key"]}
+            self._append("buyer-intents.jsonl", b)
+            self.buyer_intents[buyer["ref"]["payload_sha256"]] = b
         row = self._seal_row(payload)
         self._append("records.jsonl", row)
         return {"status": "new_version" if earlier else "recorded", "record_id": payload["record_id"],
@@ -645,6 +829,39 @@ class SprBook:
                 "seal": row["seal"]}
 
     record_settlement = seal
+
+    def _buyer_intent_of(self, intent: dict, key, at: datetime, amount: int, currency: str) -> dict:
+        """The buyer's sealed intent as a merchant receives it at checkout, with the buyer's public key. Its seal must check
+        with that key; then it is compared with the payment: declared before it, not expired, and within its cap."""
+        pem = key if isinstance(key, str) else (key or {}).get("public_pem")
+        if not pem:
+            raise ValueError("buyer_key is the buyer's public key (PEM, or {'public_pem': ...}), so the buyer's intent can be checked")
+        try:
+            kid = L.key_id_for(pem)
+        except Exception:
+            raise ValueError("buyer_key is not a public key SPR can read (Ed25519, PEM)")
+        s = L.normalize_seal((intent or {}).get("seal") or {})
+        if s["key_id"] != kid:
+            raise ValueError(f"The buyer's intent is sealed by {s['key_id']}, not by the buyer key given ({kid})")
+        alg = (key.get("algorithm") if isinstance(key, dict) else None) or s["algorithm"]
+        if not L.verify_seal(intent.get("payload"), s, pem, alg)["ok"]:
+            raise ValueError("The buyer's intent does not check with the buyer's key: it was changed, or sealed by another key")
+        c = L.check_intent(intent["payload"])
+        if not c["ok"]:
+            raise ValueError(f"The buyer's intent is missing SPR's core fields: {'; '.join(c['problems'])}")
+        ip, checks = intent["payload"], []
+        checks.append({"check": "declared_before_payment", "ok": at + CLOCK_SKEW >= _parse(ip["declared_at"]), "detail": f"Declared {ip['declared_at']}; paid {_iso(at)}"})
+        checks.append({"check": "before_intent_expiry", "ok": at <= _parse(ip["expires_at"]), "detail": f"Expires {ip['expires_at']}; paid {_iso(at)}"})
+        if ip.get("max_amount_minor") is not None:
+            comparable = not ip.get("currency") or ip["currency"] == currency
+            checks.append({"check": "within_intent_cap", "ok": comparable and abs(amount) <= ip["max_amount_minor"],
+                           "detail": f"Cap {ip['max_amount_minor']}; paid {abs(amount)} ({currency} minor units)" if comparable
+                           else f"Paid in {currency}, which cannot be compared with the {ip['currency']} cap"})
+        entity = (key.get("entity") if isinstance(key, dict) else None) or ip.get("entity")
+        k = {"key_id": kid, "algorithm": (key.get("algorithm") if isinstance(key, dict) else None) or "ed25519", "public_pem": L.public_key_pem_of(pem), **({"entity": entity} if entity else {})}
+        return {"intent": {"payload": ip, "seal": intent["seal"]}, "key": k,
+                "ref": {"intent_id": ip["intent_id"], "payload_sha256": s["payload_sha256"], "key_id": kid, "entity": ip.get("entity") or entity,
+                        "agent": (ip.get("agent") or {}).get("id"), "purpose": ip["purpose"], "within_intent": all(x["ok"] for x in checks), "checks": checks}}
 
     # ---- the label (SPR section 7) ----
     @_writes
@@ -757,6 +974,9 @@ class SprBook:
                 if cancels:
                     files["cancellations.jsonl"] = "".join(_line(c) for c in cancels)
                 files["records.jsonl"] = "".join(_line(r) for r in g)
+                buyers = [self.buyer_intents[h] for h in dict.fromkeys((r["payload"].get("buyer_intent") or {}).get("payload_sha256") for r in g) if h in self.buyer_intents]
+                if buyers:
+                    files["buyer-intents.jsonl"] = "".join(_line(b) for b in buyers)
                 parts.append(self._seal_package(files, {"index": n, "of": len(groups)}))
             return parts
         return self._locked(build)
@@ -803,6 +1023,57 @@ class SprBook:
                 f.write(text)
         check = verify_folder(out_dir)
         return {"folder": out_dir, "files": list(files), "verified": check["ok"], "passed": check["passed"], "failed": check["failed"]}
+
+    # ---- disputes (SPR section 8.1) ----
+    def dispute_pack_files(self, record_id: str, delivery: Optional[dict] = None, note: Optional[str] = None) -> dict:
+        """One payment's evidence for a chargeback response: every version of its record, the buyer's sealed intent and key,
+        a sealed statement of what the evidence shows and the same statement in plain words, under a sealed manifest.
+        Luca supplies the evidence; the merchant decides whether and how to submit it, and the card network decides."""
+        def build():
+            base = re.sub(r"-v\d+$", "", str(record_id or ""))
+            cur = next((r for r in self._current() if re.sub(r"-v\d+$", "", r["payload"]["record_id"]) == base), None)
+            if not cur:
+                raise KeyError(f"No record {record_id} in this book")
+            key = _payment_key(cur["payload"])
+            chain = [r for r in self.records if _payment_key(r["payload"]) == key]
+            files = {"keys.jsonl": "".join(_line(k) for k in self.keyring.values())}
+            ids = list(dict.fromkeys((r["payload"].get("intent") or {}).get("intent_id") for r in chain if (r["payload"].get("intent") or {}).get("intent_id")))
+            intents = [self.intents[i] for i in ids if i in self.intents]
+            if intents:
+                files["intents.jsonl"] = "".join(_line(i) for i in intents)
+            cancels = [self.cancellations[i] for i in ids if i in self.cancellations]
+            if cancels:
+                files["cancellations.jsonl"] = "".join(_line(c) for c in cancels)
+            files["records.jsonl"] = "".join(_line(r) for r in chain)
+            buyers = [self.buyer_intents[h] for h in dict.fromkeys((r["payload"].get("buyer_intent") or {}).get("payload_sha256") for r in chain) if h in self.buyer_intents]
+            if buyers:
+                files["buyer-intents.jsonl"] = "".join(_line(b) for b in buyers)
+            p = cur["payload"]
+            summary = _dispute_summary(p, delivery, self.key_id)
+            dispute = {"schema": L.DISPUTE_SCHEMA, "entity": self.entity, "record_id": p["record_id"], "records": [r["payload"]["record_id"] for r in chain],
+                       "payment": {"rail": p["rail"], "source_id": p["source"]["id"], "amount_minor": p["amount_minor"], "currency": p["currency"],
+                                   "occurred_at": p.get("occurred_at"), "direction": p.get("direction")},
+                       "payment_refs": p.get("payment_refs"), "buyer_intent": p.get("buyer_intent"), "buyer_authentication": p.get("buyer_authentication"),
+                       "delivery": delivery, "note": note, "generated_at": _iso(self._now()), "producer": self.producer,
+                       "summary_sha256": L.sha256_hex(summary.encode("utf-8"))}
+            files["dispute.json"] = json.dumps({"dispute": dispute, "seal": L.seal_with(dispute, self.key)}, indent=2, ensure_ascii=False) + "\n"
+            files["summary.txt"] = summary
+            return self._seal_package(files)
+        return self._locked(build)
+
+    def export_dispute_pack(self, record_id: str, out_dir: str, delivery: Optional[dict] = None, note: Optional[str] = None, overwrite: bool = False) -> dict:
+        """A dispute package for one payment, written to a folder of its own and checked with the book's key."""
+        if os.path.realpath(out_dir) == os.path.realpath(self.dir):
+            raise ValueError("Export to a folder of its own, outside the book's folder, which holds the private key")
+        if os.path.isdir(out_dir) and not overwrite and any(os.path.exists(os.path.join(out_dir, n)) for n in L.PACKAGE_FILES):
+            raise ValueError(f"{out_dir} already holds an export; choose another folder, or pass overwrite=True to replace it")
+        files = self.dispute_pack_files(record_id, delivery, note)
+        os.makedirs(out_dir, exist_ok=True)
+        for n, text in files.items():
+            with open(os.path.join(out_dir, n), "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+        check = verify_folder(out_dir, expected_keys=[self.key_id])
+        return {"folder": out_dir, "files": list(files), "verified": check["ok"], "passed": check["passed"], "failed": check["failed"], "summary": files["summary.txt"]}
 
     # ---- Luca, the hosted service (optional) ----
     def send_to_luca(self, url: Optional[str] = None, api_key: Optional[str] = None, max_records: int = PART_MAX_RECORDS,
@@ -875,7 +1146,7 @@ def _luca_call(url: Optional[str], api_key: Optional[str], path: str, body: dict
         raise LucaError(e.code, detail.get("error") or f"Luca answered {e.code}", detail) from None
 
 
-def verify_folder(folder: str, expected_keys: Optional[list] = None) -> dict:
+def verify_folder(folder: str, expected_keys: Optional[list] = None, buyer_keys: Optional[list] = None) -> dict:
     """Checks a package folder, reading only the package's own files, from inside the folder, and no links."""
     root = os.path.realpath(folder)
 
@@ -892,4 +1163,4 @@ def verify_folder(folder: str, expected_keys: Optional[list] = None) -> dict:
             raise ValueError(f"{name} is outside the package folder")
         with open(real, "rb") as f:
             return f.read()
-    return L.verify_package(read, expected_keys)
+    return L.verify_package(read, expected_keys, buyer_keys)

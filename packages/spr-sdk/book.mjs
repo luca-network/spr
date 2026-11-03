@@ -23,7 +23,7 @@ import { execFileSync } from "node:child_process";
 import { createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import * as L from "@luca-network/spr";
 
-export const SDK_PRODUCER = { name: "spr-sdk", version: "0.1.9" };
+export const SDK_PRODUCER = { name: "spr-sdk", version: "0.2.0" };
 const RECORD_SCHEMA = "luca.record/0.7";   // SPR section 6; the hosted service seals the same schema
 const INTENT_SCHEMA = "luca.intent/0.1";
 const CLOCK_SKEW_MS = 2 * 60_000;
@@ -49,7 +49,7 @@ function durationMs(s) {
   return ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3] ?? 0)) * 60_000;
 }
 
-const FILES = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"];
+const FILES = ["keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl", "buyer-intents.jsonl"];
 // One writer at a time: a book's folder may be opened by several processes (an MCP server and a script, an agent
 // run twice). Each write takes book.lock, reads what the others appended since, writes, and lets go.
 const LOCK_WAIT_MS = 10_000;
@@ -80,6 +80,15 @@ function identifierOf(v) {
   const s = String(v), i = s.indexOf(":");
   return i > 0 ? { scheme: s.slice(0, i), value: s.slice(i + 1) } : { scheme: null, value: s };
 }
+// One payee, however it is written: "wallet:0xAbC" and "wallet:0xabc" are the same address, and domains and email
+// addresses don't depend on case. Other schemes are compared as written.
+function payeeKey(v) {
+  const id = identifierOf(v);
+  if (!id) return null;
+  const scheme = (id.scheme ?? "").toLowerCase();
+  const value = ["wallet", "domain", "email"].includes(scheme) || /^0x[0-9a-f]+$/i.test(id.value) ? id.value.trim().toLowerCase() : id.value.trim();
+  return scheme ? `${scheme}:${value}` : value;
+}
 function mandateRefOf(m) {
   let sha256 = null;
   try { sha256 = L.sha256Hex(L.canonicalize(m)); } catch {}
@@ -93,6 +102,38 @@ function evidenceOf(input) {
     ...(kind === "onchain" ? { chain: network, tx_hash: /^0x[0-9a-f]+$/i.test(input.source_id) ? input.source_id.toLowerCase() : input.source_id } : { reference: input.source_id }) };
   return { ...built, ...(input.evidence ?? {}) };
 }
+// The merchant's order ID and the processor's transaction ID: what a merchant's or a buyer's finance team, a
+// processor and a card network use to find the same payment.
+const REF_FIELDS = ["order_id", "processor_transaction_id", "invoice_ref"];
+const refText = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
+function paymentRefsOf(input, earlier) {
+  const given = {};
+  for (const k of REF_FIELDS) {
+    const v = input[k];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== "string" || !v.trim() || v.length > 200) throw new Error(`${k} is the reference as text, up to 200 characters`);
+    given[k] = v.trim();
+  }
+  // A retry that leaves them out keeps the ones first sealed; one that adds them keeps the others.
+  const refs = { ...(earlier?.payment_refs ?? {}), ...given };
+  return Object.keys(refs).length ? Object.fromEntries(REF_FIELDS.filter((k) => refs[k] !== undefined).map((k) => [k, refs[k]])) : null;
+}
+// How the buyer proved it was them at checkout: a 3-D Secure result, a passkey, a network token's cryptogram, a
+// one-time code, or the buyer's own signed mandate. The evidence itself stays with the merchant or its processor;
+// the record holds what it was, its result, its reference and, where given, its hash.
+export const AUTH_METHODS = ["3ds", "passkey", "network_token", "otp", "agent_mandate", "other"];
+function buyerAuthOf(a) {
+  if (a === undefined || a === null) return null;
+  if (typeof a !== "object") throw new Error("buyer_authentication is an object: { method, result, reference, sha256, at }");
+  if (!AUTH_METHODS.includes(a.method)) throw new Error(`buyer_authentication.method is one of ${AUTH_METHODS.join(", ")}`);
+  if (typeof a.result !== "string" || !a.result.trim()) throw new Error("buyer_authentication.result says how it ended, such as authenticated, attempted or failed");
+  if (a.sha256 != null && !/^[0-9a-f]{64}$/i.test(a.sha256)) throw new Error("buyer_authentication.sha256 is the evidence's SHA-256 in hexadecimal (64 characters)");
+  const out = { method: a.method, result: a.result.trim() };
+  for (const k of ["reference", "eci", "provider"]) if (a[k] != null) out[k] = String(a[k]);
+  if (a.sha256 != null) out.sha256 = a.sha256.toLowerCase();
+  if (a.at != null) out.at = iso(instant(a.at, "buyer_authentication.at"));
+  return out;
+}
 function profileFactsOf(input) {
   const out = {}, id = identifierOf(input.counterparty_id);
   if (input.counterparty_type || id) out.counterparty_ref = { type: input.counterparty_type ?? null, identifier: id };
@@ -101,6 +142,29 @@ function profileFactsOf(input) {
     out.receipt = { ref: input.receipt.ref ?? null, sha256: input.receipt.sha256?.toLowerCase() ?? null, kind: input.receipt.kind ?? null };
   }
   return out;
+}
+
+// The dispute package's statement in plain words. Every line says what a sealed file in the package shows.
+function disputeSummary(p, delivery, keyId) {
+  const d = decimalsOf(p.currency), money = (m) => `${decimalAmount(Math.abs(m), d) || m} ${p.currency}`;
+  const L2 = [];
+  L2.push(`Payment evidence for ${p.record_id}`);
+  L2.push("");
+  L2.push(`Payment: ${money(p.amount_minor)} ${p.direction === "inflow" ? "received by" : "paid by"} ${p.entity} on ${p.occurred_at ?? p.settled_on}, ${p.rail} reference ${p.source.id}.`);
+  const refs = p.payment_refs ?? {};
+  if (refs.order_id || refs.processor_transaction_id || refs.invoice_ref)
+    L2.push(`References: ${[refs.order_id && `order ${refs.order_id}`, refs.processor_transaction_id && `processor transaction ${refs.processor_transaction_id}`, refs.invoice_ref && `invoice ${refs.invoice_ref}`].filter(Boolean).join(", ")}.`);
+  const b = p.buyer_intent;
+  if (b) {
+    L2.push(`Authorized by: ${b.entity ?? "the buyer"}${b.agent ? `, through its agent ${b.agent}` : ""}. Before paying, it declared this purchase: "${b.purpose}" (intent ${b.intent_id}). The declaration is sealed with the buyer's own key, ${b.key_id}, and checks with it.`);
+    L2.push(`Against that declaration: ${b.checks.map((c) => `${c.ok ? "passed" : "FAILED"} ${c.check.replace(/_/g, " ")} (${c.detail})`).join("; ")}.`);
+  } else L2.push("Authorized by: no buyer's intent is recorded for this payment.");
+  const a = p.buyer_authentication;
+  L2.push(a ? `Buyer authentication: ${a.method}, ${a.result}${a.reference ? `, reference ${a.reference}` : ""}${a.eci ? `, ECI ${a.eci}` : ""}${a.provider ? `, by ${a.provider}` : ""}${a.at ? `, at ${a.at}` : ""}${a.sha256 ? `; the evidence's SHA-256 is ${a.sha256}` : ""}.` : "Buyer authentication: none recorded.");
+  if (delivery) L2.push(`Delivery: ${[delivery.method, delivery.delivered_at && `delivered ${delivery.delivered_at}`, delivery.reference && `reference ${delivery.reference}`, delivery.sha256 && `proof SHA-256 ${delivery.sha256}`].filter(Boolean).join(", ")}.`);
+  L2.push("");
+  L2.push(`Every statement above comes from a file in this package sealed with ${p.entity}'s key ${keyId}, or with the buyer's own key. Check the package with: spr-verify <folder> --key ${keyId}`);
+  return L2.join("\n") + "\n";
 }
 
 // The book's payments as xBRL-CSV in the concepts of the draft profile: one row per payment, the current version of
@@ -135,6 +199,7 @@ const MPP_COLUMNS = [
   ["settlementReference", "SettlementReference", "string"], ["settlementEvidenceType", "SettlementEvidenceType", "string"], ["settlementEvidenceValue", "SettlementEvidenceValue", "string"], ["settlementProvider", "SettlementProvider", "string"],
   ["accountingDate", "AccountingDate", "date"], ["accountingTimeZone", "AccountingTimeZone", "string"], ["generalLedgerAccount", "GeneralLedgerAccount", "string"], ["accountingClassification", "AccountingClassification", "string"],
   ["receiptReference", "ReceiptReference", "string"], ["receiptHash", "ReceiptHash", "string"],
+  ["orderReference", "OrderReference", "string"], ["processorTransactionReference", "ProcessorTransactionReference", "string"], ["invoiceReference", "InvoiceReference", "string"],
 ];
 function mppRow(row, intent, book) {
   const p = row.payload, ip = intent?.payload ?? null, ev = p.evidence ?? {}, d = decimalsOf(p.currency);
@@ -161,6 +226,7 @@ function mppRow(row, intent, book) {
     accountingDate: p.settled_on ?? "", accountingTimeZone: p.time_zone ?? book.cfg.timeZone,
     generalLedgerAccount: p.classification?.account?.code ?? p.gl_account ?? "", accountingClassification: p.classification?.nature?.code ?? "",
     receiptReference: p.receipt?.ref ?? "", receiptHash: p.receipt?.sha256 ?? "",
+    orderReference: p.payment_refs?.order_id ?? "", processorTransactionReference: p.payment_refs?.processor_transaction_id ?? "", invoiceReference: p.payment_refs?.invoice_ref ?? "",
   };
 }
 // Text written by agents (purpose, memo, counterparty and the like) goes into a file people open in spreadsheets. A text
@@ -271,6 +337,8 @@ export class SprBook {
     this.records = [];              // every version, in the order sealed
     this.byPayment = new Map();     // entity:rail:source -> current version
     this.labels = [];
+    this.approvedChecks = [];       // pre-payment checks that approved, for the duplicate check
+    this.buyerIntents = new Map();  // payload hash -> { intent, key }: buyers' own sealed intents, kept by a merchant
   }
   refresh() {
     for (const n of FILES) {
@@ -293,6 +361,8 @@ export class SprBook {
     else if (name === "cancellations.jsonl") this.cancellations.set(row.payload.intent_id, row);
     else if (name === "records.jsonl") { this.records.push(row); this.byPayment.set(paymentKey(row.payload), row); }
     else if (name === "labels.jsonl") this.labels.push(row);
+    else if (name === "checks.jsonl" && row.payload?.decision === "approve") this.approvedChecks.push(row.payload);
+    else if (name === "buyer-intents.jsonl") this.buyerIntents.set(L.normalizeSeal(row.intent.seal).payload_sha256, row);
   }
   locked(fn) {
     if (this.lockDepth > 0) { this.lockDepth++; try { return fn(); } finally { this.lockDepth--; } }
@@ -367,7 +437,8 @@ export class SprBook {
   }
 
   // The mandate's limits, checked against the most the agent could pay.
-  mandateChecks(amount, currency, at) {
+  // With a payee given (undefined skips it), a mandate that lists its payees is checked against it too.
+  mandateChecks(amount, currency, at, payee) {
     const m = this.mandate();
     if (!m) return { decision: "none", authority: "none", checks: [], mandate_id: null };
     const checks = [];
@@ -375,6 +446,11 @@ export class SprBook {
     if (m.max_per_payment_minor !== undefined) checks.push({ check: "per_payment", ok: amount === null || amount <= m.max_per_payment_minor, detail: `Limit ${m.max_per_payment_minor}; up to ${amount ?? "no amount given"}` });
     if (m.valid_from || m.valid_until) checks.push({ check: "in_date", ok: (!m.valid_from || at >= new Date(m.valid_from)) && (!m.valid_until || at <= new Date(m.valid_until)),
       detail: `Valid ${m.valid_from ?? "any time"} to ${m.valid_until ?? "no end"}` });
+    if (Array.isArray(m.payees) && payee !== undefined) {
+      const listed = m.payees.map((x) => payeeKey(typeof x === "object" && x !== null && !x.value ? x.id : x)).filter(Boolean);
+      checks.push({ check: "approved_payee", ok: payee !== null && listed.includes(payee),
+        detail: payee === null ? "No payee given, and the mandate pays only the payees it lists" : listed.includes(payee) ? `${payee} is on the mandate's list of payees` : `${payee} is not on the mandate's list of payees` });
+    }
     return { decision: checks.every((c) => c.ok) ? "within_mandate" : "outside_mandate", authority: SELF_DECLARED, checks, mandate_id: m.mandate_id ?? null };
   }
 
@@ -389,12 +465,13 @@ export class SprBook {
     const now = this.now();
     const ttl = input.expires_in ? durationMs(input.expires_in) : (input.expires_in_hours ?? 72) * 3600_000;
     const currency = input.currency ? input.currency.toUpperCase() : null;
-    const pre = this.mandateChecks(cap ?? input.expected_amount_minor ?? null, currency, now);
+    const payee = input.payee_id ? identifierOf(input.payee_id) : null;
+    const pre = this.mandateChecks(cap ?? input.expected_amount_minor ?? null, currency, now, payee ? payeeKey(payee) : undefined);
     const payload = {
       schema: INTENT_SCHEMA, intent_id: `int_${hex(10)}`,
       agent: this.agentInfo(), entity: this.cfg.entity, ...this.principalInfo(), mandate_id: pre.mandate_id ?? null,
       ...(this.mandate() ? { mandate: mandateRefOf(this.mandate()) } : {}),
-      purpose: input.purpose.trim(), counterparty: input.counterparty ?? null,
+      purpose: input.purpose.trim(), counterparty: input.counterparty ?? null, ...(payee ? { payee } : {}),
       expected_amount_minor: input.expected_amount_minor ?? null, max_amount_minor: cap, currency,
       rail: input.rail ?? null, rail_ref: input.rail_ref ?? null, terms: input.terms ?? null, ...(input.product ? { product: String(input.product) } : {}),
       declared_at: iso(now), expires_at: iso(new Date(now.getTime() + ttl)),
@@ -449,18 +526,56 @@ export class SprBook {
     const currency = String(input.currency ?? "").toUpperCase();
     const i = this.intentFor(input.intent_id, input.nonce);
     const consent = i ? this.consent(i, { at: now, amount: input.amount_minor, currency, nonce: input.nonce ?? null }) : null;
-    const m = this.mandateChecks(Math.abs(input.amount_minor), currency, now);
+    const payee = payeeKey(input.payee_id);
+    const m = this.mandateChecks(Math.abs(input.amount_minor), currency, now, payee);
+    const intentPayee = i?.payload.payee ? payeeKey(i.payload.payee) : null;
     const checks = [
       { check: "open_intent", ok: Boolean(i), detail: i ? `Intent ${i.payload.intent_id}` : "No intent named or matched by the nonce" },
       ...(consent?.checks ?? []).filter((c) => c.severity === "hard"),
+      ...(intentPayee ? [{ check: "payee_matches_intent", ok: payee === intentPayee,
+        detail: payee === intentPayee ? `Paying ${payee}, the payee the intent named` : `The intent named ${intentPayee}; this payment is to ${payee ?? "a payee not given"}` }] : []),
       ...m.checks,
+      ...this.duplicateChecks({ invoice: refText(input.invoice_ref), payee, counterparty: input.counterparty ?? null, amount: Math.abs(input.amount_minor), currency, at: now, intentId: i?.payload.intent_id ?? null }),
     ];
-    const row = this.sealRow({ schema: "luca.payment-check/0.1", id: `pck_${hex(8)}`, checked_at: iso(now), agent: this.cfg.agentId,
+    const row = this.sealRow({ schema: "luca.payment-check/0.1", id: `pck_${hex(8)}`, checked_at: iso(now), agent: this.cfg.agentId, intent_id: i?.payload.intent_id ?? null,
       request: { ...input },
      
       decision: checks.every((c) => c.ok) ? "approve" : "decline", authority: m.authority, checks, producer: this.cfg.producer });
     this.append("checks.jsonl", row);
+    if (row.payload.decision === "approve") this.approvedChecks.push(row.payload);
     return { id: row.payload.id, decision: row.payload.decision, authority: m.authority, checks, reasons: checks.filter((c) => !c.ok).map((c) => `${c.check}: ${c.detail}`), seal: row.seal };
+  }
+
+  // The same invoice paid twice, or (where the mandate sets duplicate_window) the same amount to the same payee again
+  // within the window. Payments already recorded count, and so do approvals under another intent, since a payment
+  // approved a moment ago may not be recorded yet. A retry under the same intent is not a duplicate.
+  duplicateChecks(p) {
+    const out = [];
+    const partyOf = (payee, counterparty) => payee ?? (counterparty ? `name:${counterparty}` : null);
+    const party = partyOf(p.payee, p.counterparty);
+    const recPartyOf = (r) => partyOf(payeeKey(r.counterparty_ref?.identifier ?? null), r.counterparty ?? null);
+    const chkPartyOf = (c) => partyOf(payeeKey(c.request?.payee_id ?? null), c.request?.counterparty ?? null);
+    const otherIntent = (c) => (c.intent_id ?? c.request?.intent_id ?? null) !== p.intentId;
+    const outflows = this.current().map((r) => r.payload).filter((r) => r.direction !== "inflow" && r.state !== "refunded");
+    if (p.invoice) {
+      const same = (x) => !party || !x || x === party;
+      const paid = outflows.find((r) => r.payment_refs?.invoice_ref === p.invoice && same(recPartyOf(r)));
+      const approved = this.approvedChecks.find((c) => refText(c.request?.invoice_ref) === p.invoice && otherIntent(c) && same(chkPartyOf(c)));
+      out.push({ check: "not_already_paid", ok: !paid && !approved,
+        detail: paid ? `Invoice ${p.invoice} was already paid: ${paid.record_id}` : approved ? `Invoice ${p.invoice} was already approved for payment: ${approved.id}` : `Invoice ${p.invoice} has not been paid before` });
+    }
+    const w = this.mandate()?.duplicate_window;
+    if (w && party) {
+      let ms;
+      try { ms = durationMs(w); } catch { throw new Error(`duplicate_window in mandate.json must be an ISO 8601 duration such as P1D or PT12H, got ${w}`); }
+      const since = p.at.getTime() - ms;
+      const sameAmount = (a, c) => Math.abs(a) === p.amount && String(c ?? "").toUpperCase() === p.currency;
+      const paid = outflows.find((r) => recPartyOf(r) === party && sameAmount(r.amount_minor, r.currency) && Date.parse(r.occurred_at) >= since);
+      const approved = this.approvedChecks.find((c) => chkPartyOf(c) === party && otherIntent(c) && sameAmount(c.request?.amount_minor ?? 0, c.request?.currency) && Date.parse(c.checked_at) >= since);
+      const hit = paid?.record_id ?? approved?.id ?? null;
+      out.push({ check: "not_a_repeat", ok: !hit, detail: hit ? `The same amount to ${party} within ${w}: ${hit}` : `No payment of the same amount to ${party} within ${w}` });
+    }
+    return out;
   }
 
 
@@ -511,12 +626,20 @@ export class SprBook {
     const i = this.intentFor(input.intent_id, nonce);
     if (input.intent_id && !i) throw new Error(`No intent ${input.intent_id} in this book`);
     const direction = input.direction ?? "outflow";
+    const refs = paymentRefsOf(input, earlier?.payload);
+    // At a merchant: the buyer's own sealed intent, checked with the buyer's key, and how the buyer authenticated.
+    const buyer = input.buyer_intent ? this.buyerIntentOf(input.buyer_intent, input.buyer_key, { at, amount: input.amount_minor, currency }) : null;
+    const buyerIntent = buyer?.ref ?? earlier?.payload.buyer_intent ?? null;
+    const buyerAuth = buyerAuthOf(input.buyer_authentication) ?? earlier?.payload.buyer_authentication ?? null;
     const consent = i && direction === "outflow" ? this.consent(i, { at, amount: input.amount_minor, currency, nonce }) : null;
 
     const facts = {
       direction, state: input.amount_minor < 0 ? "refunded" : input.state === "pending" ? "pending" : "cleared",
       amount_minor: input.amount_minor, currency, occurred_at: iso(at), counterparty: input.counterparty ?? null,
       memo: input.memo ?? null, intent: i ? { intent_id: i.payload.intent_id, payload_sha256: i.seal.payload_sha256 } : null,
+      ...(refs ? { payment_refs: refs } : {}),
+      ...(buyerIntent ? { buyer_intent: buyerIntent } : {}),
+      ...(buyerAuth ? { buyer_authentication: buyerAuth } : {}),
     };
     // The same facts again are a retry. Different facts under the same payment are a correction, and need a reason;
     // only a pending payment clearing is taken as it comes.
@@ -524,7 +647,10 @@ export class SprBook {
     if (earlier) {
       const changed = Object.keys(facts).filter((k) => L.canonicalize(facts[k] ?? null) !== L.canonicalize(earlier.payload[k] ?? null));
       if (!changed.length) return { status: "unchanged", record_id: earlier.payload.record_id, seal: earlier.seal };
-      const clearing = changed.length === 1 && changed[0] === "state" && earlier.payload.state === "pending";
+      // Taken as it comes: a pending payment clearing, and an order or processor reference added where none was sealed.
+      const added = (k) => (k === "payment_refs" && Object.keys(earlier.payload.payment_refs ?? {}).every((f) => earlier.payload.payment_refs[f] === refs?.[f]))
+        || ((k === "buyer_intent" || k === "buyer_authentication") && earlier.payload[k] === undefined);
+      const clearing = changed.every((k) => (k === "state" && earlier.payload.state === "pending") || added(k));
       const reason = typeof input.correction?.reason === "string" ? input.correction.reason.trim() : "";
       if (!clearing && !reason)
         return { status: "conflict", record_id: earlier.payload.record_id, sealed: false,
@@ -550,11 +676,86 @@ export class SprBook {
     };
     const problems = L.checkRecord(payload).problems;
     if (problems.length) throw new Error(`The record would not meet SPR: ${problems.join("; ")}`);
+    if (buyer && !this.buyerIntents.has(buyer.ref.payload_sha256)) {
+      const b = { intent: buyer.intent, key: buyer.key };
+      this.append("buyer-intents.jsonl", b);
+      this.buyerIntents.set(buyer.ref.payload_sha256, b);
+    }
     const row = this.sealRow(payload);
     this.append("records.jsonl", row);
     return { status: earlier ? "new_version" : "recorded", record_id: payload.record_id, within_consent: consent?.within_consent ?? null,
       binding: consent?.binding.status ?? null, checks: consent?.checks ?? [],
       seal: row.seal };
+  }
+
+  // The buyer's sealed intent as a merchant receives it at checkout, with the buyer's public key. Its seal must check
+  // with that key; then it is compared with the payment: declared before it, not expired, and within its cap.
+  buyerIntentOf(intent, key, p) {
+    const pem = typeof key === "string" ? key : key?.public_pem;
+    if (!pem) throw new Error("buyer_key is the buyer's public key (PEM, or { public_pem }), so the buyer's intent can be checked");
+    let keyId;
+    try { keyId = L.keyIdFor(pem); } catch { throw new Error("buyer_key is not a public key SPR can read (Ed25519, PEM)"); }
+    const s = L.normalizeSeal(intent?.seal ?? {});
+    if (s.key_id !== keyId) throw new Error(`The buyer's intent is sealed by ${s.key_id}, not by the buyer key given (${keyId})`);
+    if (!L.verifySeal(intent.payload, s, pem, key?.algorithm ?? s.algorithm).ok) throw new Error("The buyer's intent does not check with the buyer's key: it was changed, or sealed by another key");
+    const c = L.checkIntent(intent.payload);
+    if (!c.ok) throw new Error(`The buyer's intent is missing SPR's core fields: ${c.problems.join("; ")}`);
+    const ip = intent.payload, checks = [];
+    checks.push({ check: "declared_before_payment", ok: p.at.getTime() + CLOCK_SKEW_MS >= Date.parse(ip.declared_at), detail: `Declared ${ip.declared_at}; paid ${iso(p.at)}` });
+    checks.push({ check: "before_intent_expiry", ok: p.at.getTime() <= Date.parse(ip.expires_at), detail: `Expires ${ip.expires_at}; paid ${iso(p.at)}` });
+    if (ip.max_amount_minor != null) {
+      const comparable = !ip.currency || ip.currency === p.currency;
+      checks.push({ check: "within_intent_cap", ok: comparable && Math.abs(p.amount) <= ip.max_amount_minor,
+        detail: comparable ? `Cap ${ip.max_amount_minor}; paid ${Math.abs(p.amount)} (${p.currency} minor units)` : `Paid in ${p.currency}, which cannot be compared with the ${ip.currency} cap` });
+    }
+    const k = { key_id: keyId, algorithm: key?.algorithm ?? "ed25519", public_pem: L.publicKeyPemOf(pem), ...(key?.entity ?? ip.entity ? { entity: key?.entity ?? ip.entity } : {}) };
+    return { intent: { payload: ip, seal: intent.seal }, key: k,
+      ref: { intent_id: ip.intent_id, payload_sha256: s.payload_sha256, key_id: keyId, entity: ip.entity ?? key?.entity ?? null, agent: ip.agent?.id ?? null,
+        purpose: ip.purpose, within_intent: checks.every((x) => x.ok), checks } };
+  }
+
+  // ---- disputes (SPR section 8.1) ----
+  // One payment's evidence for a chargeback response: every version of its record, the buyer's sealed intent and key,
+  // a sealed statement of what the evidence shows, and the same statement in plain words, under a sealed manifest.
+  // Luca supplies the evidence; the merchant decides whether and how to submit it, and the card network decides.
+  disputePackFiles(recordId, opts = {}) {
+    return this.locked(() => {
+      const base = String(recordId ?? "").replace(/-v\d+$/, "");
+      const cur = this.current().find((r) => r.payload.record_id.replace(/-v\d+$/, "") === base);
+      if (!cur) throw new Error(`No record ${recordId} in this book`);
+      const key = paymentKey(cur.payload);
+      const chain = this.records.filter((r) => paymentKey(r.payload) === key);
+      const line = (row) => JSON.stringify(row) + "\n";
+      const files = { "keys.jsonl": [...this.keyring.values()].map(line).join("") };
+      const ids = new Set(chain.map((r) => r.payload.intent?.intent_id).filter(Boolean));
+      const intents = [...ids].map((id) => this.intents.get(id)).filter(Boolean);
+      if (intents.length) files["intents.jsonl"] = intents.map(line).join("");
+      const cancels = [...ids].map((id) => this.cancellations.get(id)).filter(Boolean);
+      if (cancels.length) files["cancellations.jsonl"] = cancels.map(line).join("");
+      files["records.jsonl"] = chain.map(line).join("");
+      const buyers = [...new Set(chain.map((r) => r.payload.buyer_intent?.payload_sha256).filter(Boolean))].map((h) => this.buyerIntents.get(h)).filter(Boolean);
+      if (buyers.length) files["buyer-intents.jsonl"] = buyers.map(line).join("");
+      const p = cur.payload, delivery = opts.delivery ?? null;
+      const summary = disputeSummary(p, delivery, this.keyId);
+      const dispute = { schema: L.DISPUTE_SCHEMA, entity: this.cfg.entity, record_id: p.record_id, records: chain.map((r) => r.payload.record_id),
+        payment: { rail: p.rail, source_id: p.source.id, amount_minor: p.amount_minor, currency: p.currency, occurred_at: p.occurred_at, direction: p.direction },
+        payment_refs: p.payment_refs ?? null, buyer_intent: p.buyer_intent ?? null, buyer_authentication: p.buyer_authentication ?? null,
+        delivery, note: opts.note ?? null, generated_at: iso(this.now()), producer: this.cfg.producer, summary_sha256: L.sha256Hex(Buffer.from(summary, "utf8")) };
+      files["dispute.json"] = JSON.stringify({ dispute, seal: L.sealWith(dispute, this.key) }, null, 2) + "\n";
+      files["summary.txt"] = summary;
+      return this.sealPackage(files);
+    });
+  }
+  exportDisputePack(recordId, outDir, opts = {}) {
+    const out = resolve(outDir);
+    if (out === resolve(this.dir)) throw new Error("Export to a folder of its own, outside the book's folder, which holds the private key");
+    if (existsSync(out) && !opts.overwrite && L.PACKAGE_FILES.some((n) => existsSync(join(out, n))))
+      throw new Error(`${outDir} already holds an export; choose another folder, or pass overwrite: true to replace it`);
+    const files = this.disputePackFiles(recordId, opts);
+    mkdirSync(outDir, { recursive: true });
+    for (const [n, text] of Object.entries(files)) writeFileSync(join(outDir, n), text);
+    const check = L.verifyPackage((n) => existsSync(join(outDir, n)) ? readFileSync(join(outDir, n)) : null, { expectedKeys: [this.keyId] });
+    return { folder: outDir, files: Object.keys(files), verified: check.ok, passed: check.passed, failed: check.failed, summary: files["summary.txt"] };
   }
 
   // ---- the label (SPR section 7) ----
@@ -656,6 +857,8 @@ export class SprBook {
         const cancels = [...ids].map((id) => this.cancellations.get(id)).filter(Boolean);
         if (cancels.length) files["cancellations.jsonl"] = cancels.map(line).join("");
         files["records.jsonl"] = g.records.map(line).join("");
+        const buyers = [...new Set(g.records.map((r) => r.payload.buyer_intent?.payload_sha256).filter(Boolean))].map((h) => this.buyerIntents.get(h)).filter(Boolean);
+        if (buyers.length) files["buyer-intents.jsonl"] = buyers.map(line).join("");
         return this.sealPackage(files, { index: i + 1, of: groups.length });
       });
     });

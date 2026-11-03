@@ -19,7 +19,9 @@ record = book.seal(rail="x402", source_id=tx_hash, amount_minor=10000, currency=
 
 The folder, files and records are the same as the JavaScript SDK's, so either language opens the other's book.
 
-The book runs on your machine and makes no call to Luca. It checks each payment against the agent's declared intent: the cap, the expiry, and whether the intent was withdrawn. An optional `mandate.json` in the folder adds one limit across all the agent's intents; whoever keeps the folder writes it, so results report it as `authority: "self-declared"`. Spending authority granted by someone else needs that party's own record, such as a mandate approved in Luca's hosted service.
+The book runs on your machine and makes no call to Luca. It checks each payment against the agent's declared intent: the cap, the expiry, whether the intent was withdrawn, the payee the intent named (`payee_id`), and whether the same invoice (`invoice_ref`) was paid already. An optional `mandate.json` in the folder adds one limit across all the agent's intents, the payees it may pay (`payees`) and a window for repeats (`duplicate_window`, such as `P1D`); keep it where the agent can't write; whoever keeps the folder writes it, so results report it as `authority: "self-declared"`. Spending authority granted by someone else needs that party's own record, such as a mandate approved in Luca's hosted service.
+
+A merchant records each payment it receives with `direction="inflow"`, and can add the buyer's own sealed intent with the buyer's public key (`buyer_intent=`, `buyer_key=`), how the buyer authenticated (`buyer_authentication=`), and the order and processor references (`order_id=`, `processor_transaction_id=`). `book.export_dispute_pack(record_id, folder, delivery=...)` writes one payment's evidence for a dispute response, with a plain-words `summary.txt`; check it with `python -m spr <folder> --key <merchant key> --buyer-key <buyer key>`.
 
 Times need their offset; a time without one is refused. Different facts for a payment already sealed return `conflict` and seal nothing, unless you pass `correction={"reason": ...}`.
 

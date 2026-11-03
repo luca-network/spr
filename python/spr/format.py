@@ -369,7 +369,9 @@ def check_key_handover(row: dict, keys: dict) -> dict:
     return {"ok": v["ok"], "detail": "" if v["ok"] else "the handover is not the one sealed" if not v["hash_matches"] else "the earlier key's signature does not verify"}
 
 
-PACKAGE_FILES = ["manifest.json", "keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl"]
+PACKAGE_FILES = ["manifest.json", "keys.jsonl", "intents.jsonl", "cancellations.jsonl", "checks.jsonl", "records.jsonl", "labels.jsonl",
+                 "buyer-intents.jsonl", "dispute.json", "summary.txt"]
+DISPUTE_SCHEMA = "luca.dispute-pack/0.1"
 _KEY_ID = re.compile(r"ed25519:[0-9a-f]{16}")
 
 
@@ -391,7 +393,7 @@ def check_record_set(payloads: list) -> dict:
     return {"ok": not problems, "problems": problems}
 
 
-def verify_package(read: Callable[[str], Optional[bytes]], expected_keys: Optional[list] = None) -> dict:
+def verify_package(read: Callable[[str], Optional[bytes]], expected_keys: Optional[list] = None, buyer_keys: Optional[list] = None) -> dict:
     """Every check of a package (section 8). Without expected_keys the result shows the package is consistent with the
     keys it carries (trust "consistency-only"). With the company's public keys or key IDs, every seal must be by one
     of them or by a key one of them handed over to (trust "expected-key"); any other signer fails."""
@@ -483,6 +485,51 @@ def verify_package(read: Callable[[str], Optional[bytes]], expected_keys: Option
                 check(f"record {p['record_id']}: bound only when the nonce is the intent's fingerprint", (b.get("status") == "bound") == (b["nonce"].lower() == expected), f"expected {expected}")
     rs = check_record_set([r.get("payload") or {} for r in records])
     check("no record ID holds two different records, and no payment has two records of one version", rs["ok"], "; ".join(rs["problems"]))
+
+    # A merchant's records may name the buyer's own sealed intent (section 8.1). Each is sealed with the buyer's key,
+    # which travels beside it, and is checked with that key alone; the buyer's keys never count as the company's.
+    buyer_by_hash, buyer_signers = {}, []
+    for b in jsonl("buyer-intents.jsonl"):
+        it = (b or {}).get("intent") or {}
+        s, k, iid = normalize_seal(it.get("seal") or {}), (b or {}).get("key") or {}, (it.get("payload") or {}).get("intent_id")
+        try:
+            key_ok = bool(_KEY_ID.fullmatch(k.get("key_id") or "")) and key_id_for(k["public_pem"]) == k["key_id"] and s["key_id"] == k["key_id"]
+        except Exception:
+            key_ok = False
+        v = verify_seal(it.get("payload"), s, k["public_pem"], k.get("algorithm") or s["algorithm"]) if key_ok else None
+        why = ("the key beside it is not the key that sealed it" if not key_ok else "" if v["ok"]
+               else "the payload's hash is not the sealed hash" if not v["hash_matches"] else "the signature does not verify with that key")
+        check(f"the buyer's intent {iid} is sealed by the buyer's key {k.get('key_id')}", bool(v and v["ok"]), why)
+        c = check_intent(it.get("payload"))
+        check(f"the buyer's intent {iid} has the core fields", c["ok"], "; ".join(c["problems"]))
+        if s.get("key_id") and s["key_id"] not in buyer_signers:
+            buyer_signers.append(s["key_id"])
+        buyer_by_hash[s.get("payload_sha256")] = b
+    for r in records:
+        bi = (r.get("payload") or {}).get("buyer_intent")
+        if not bi:
+            continue
+        b = buyer_by_hash.get(bi.get("payload_sha256"))
+        check(f"record {r['payload']['record_id']}: the buyer's intent it names is in the package",
+              bool(b) and b["intent"]["payload"].get("intent_id") == bi.get("intent_id") and b["key"].get("key_id") == bi.get("key_id"),
+              f"{bi.get('intent_id')} ({bi.get('payload_sha256')})")
+    expected_buyer = [k if isinstance(k, str) and _KEY_ID.fullmatch(k) else key_id_for(k) for k in (buyer_keys or [])]
+    if expected_buyer:
+        check(f"every buyer's intent is sealed by an expected buyer key {' or '.join(expected_buyer)}", all(k in expected_buyer for k in buyer_signers),
+              ", ".join(k for k in buyer_signers if k not in expected_buyer))
+
+    # A dispute package: its sealed statement names records in the package, and its summary is the text it hashed.
+    db = get("dispute.json")
+    if db:
+        d = json.loads(db.decode("utf-8"))
+        ok, why = seal_ok(d.get("dispute"), d.get("seal"))
+        check("dispute.json is sealed", ok, why)
+        check("dispute.json is a dispute package statement", (d.get("dispute") or {}).get("schema") == DISPUTE_SCHEMA, str((d.get("dispute") or {}).get("schema")))
+        for rid in (d.get("dispute") or {}).get("records", []):
+            check(f"dispute.json: record {rid} is in the package", rid in by_record)
+        summary = get("summary.txt")
+        check("summary.txt is the summary dispute.json was sealed with", bool(summary) and sha256_hex(summary) == (d.get("dispute") or {}).get("summary_sha256"),
+              "its SHA-256 differs" if summary else "missing")
     expected = [k if isinstance(k, str) and _KEY_ID.fullmatch(k) else key_id_for(k) for k in (expected_keys or [])]
     trust = "consistency-only"
     if expected:
@@ -497,7 +544,7 @@ def verify_package(read: Callable[[str], Optional[bytes]], expected_keys: Option
         trust = "expected-key" if check(f"every seal is by the company's expected key {' or '.join(expected)}, or a key it handed over to", not strangers,
                                         f"sealed by {', '.join(strangers)}, which the expected key did not hand over to" if strangers else "") else "untrusted"
     failed = sum(1 for r in results if not r["ok"])
-    return {"kind": kind, "ok": failed == 0, "trust": trust, "signers": signers, "expected_keys": expected,
+    return {"kind": kind, "ok": failed == 0, "trust": trust, "signers": signers, "expected_keys": expected, "buyer_signers": buyer_signers,
             "passed": len(results) - failed, "failed": failed, "results": results}
 
 
