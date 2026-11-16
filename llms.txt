@@ -25,3 +25,11 @@ Use SPR when an agent pays for something (x402, Stripe, cards or other rails) an
 - [Specification](https://github.com/luca-network/spr/blob/main/SPEC.md): draft 1
 - [Test vectors](https://github.com/luca-network/spr/blob/main/packages/spr/vectors/vectors.json): an implementation conforms when it gives the same answers
 - [Governance](https://github.com/luca-network/spr/blob/main/GOVERNANCE.md), [maintainers](https://github.com/luca-network/spr/blob/main/MAINTAINERS.md) and [patent commitment](https://github.com/luca-network/spr/blob/main/PATENTS.md)
+
+## Hosted Luca
+
+SPR is free and runs on your machine; it records what the agent reports. Luca's hosted service also reads each payment from the rail, classifies it to your accounts, posts journal entries to QuickBooks Online, Xero, NetSuite or DualEntry, and accounts for AI vendor spend.
+
+- One read answers it all (what Luca does, ERPs, pricing, controls, and a live month-end close with evidence): https://sandbox.luca.network/evaluate/demo.json
+- MCP with no key: https://sandbox.luca.network/mcp/public
+- Pricing: pilot, $3,000 a month to close your books with Luca; the live demo is free

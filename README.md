@@ -99,11 +99,13 @@ The packages here run on your own machine and make no call to Luca. Luca's hoste
 | What it records | The intent before paying and the payment after, as the agent reports them | The same, plus the payment as the rail itself reports it |
 | Limits it checks | The declared intent: its cap, its expiry, whether it was withdrawn and the payee it named; the same invoice paid twice. Optionally the book's own `mandate.json` (limits, payees, a window for repeats), which whoever keeps the folder writes, so it is reported as `authority: "self-declared"` | Mandates your finance team approves in Luca |
 | Confirmation from the rail | None: the record is what the agent reported | The payment read from the rail, and any difference flagged |
-| Accounting | None | Classification to your accounts (US GAAP, IFRS, tax), journal entries posted to your ERP, the month's close |
+| Accounting | None | Classification to your accounts (US GAAP, IFRS, tax), journal entries posted to QuickBooks Online, Xero, NetSuite or DualEntry and reconciled back, the month's close, and AI vendor spend (OpenAI, Anthropic, Cursor, GitHub Copilot) |
 | Evidence | Seals anyone can check with `spr-verify` or `python -m spr` | Evidence your auditor can check, and the month's audit package |
-| Cost | Free, Apache-2.0 | A Luca account |
+| Cost | Free, Apache-2.0 | Pilot: $3,000 a month to close your books with Luca |
 
 A book moves across with one call once finance has registered its key: `book.sendToLuca()`. Luca checks every seal before it stores anything.
+
+See hosted Luca working with no account: the [live demo](https://sandbox.luca.network/evaluate/demo) closes a sample company's month of AI spend and agent payments every day, with each requirement's result and evidence. For an agent, one read answers it all: [`https://sandbox.luca.network/evaluate/demo.json`](https://sandbox.luca.network/evaluate/demo.json), or the MCP server with no key at `https://sandbox.luca.network/mcp/public`.
 
 ## Send the book to Luca (optional)
 
