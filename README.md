@@ -1,4 +1,5 @@
 # SPR: the Sealed Payment Record
+[![luca-network/spr MCP server](https://glama.ai/mcp/servers/luca-network/spr/badges/score.svg)](https://glama.ai/mcp/servers/luca-network/spr)
 
 Your AI agent pays for data, compute and services, and your finance team and auditor can't see what each payment was for. SPR records every payment your agent makes, before and after it pays, sealed with your company's own key on your own machine. Anyone can check the seals. No service has to be trusted, Luca's included.
 
